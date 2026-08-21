@@ -22,6 +22,22 @@ function routing() {
   return getSessionRouting();
 }
 
+/**
+ * Actions the bridge will drop: send_card is fire-and-forget, so only
+ * `url` actions survive as link buttons (src/channels/chat-sdk-bridge.ts,
+ * "Non-URL actions are dropped"). Counted here so the agent is told, instead
+ * of assuming the platform cannot render buttons.
+ */
+function countCallbackActions(card: Record<string, unknown>): number {
+  const actions = card.actions;
+  if (!Array.isArray(actions)) return 0;
+  return actions.filter((a) => {
+    if (!a || typeof a !== 'object') return true;
+    const url = (a as Record<string, unknown>).url;
+    return !(typeof url === 'string' && url);
+  }).length;
+}
+
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
 }
@@ -138,9 +154,14 @@ export const sendCard: McpToolDefinition = {
       properties: {
         card: {
           type: 'object',
-          description: 'Card structure with title, description, and optional children/actions',
+          description:
+            'Card structure with title, description, and optional children/actions. Actions need a url and render as link buttons; actions without a url are dropped on every channel. For clickable buttons use ask_user_question.',
         },
-        fallbackText: { type: 'string', description: 'Text fallback for platforms without card support' },
+        fallbackText: {
+          type: 'string',
+          description:
+            'Plain-text version of the card for channels that render cards as text. Not related to buttons: send_card never renders callback buttons anywhere.',
+        },
       },
       required: ['card'],
     },
@@ -162,6 +183,12 @@ export const sendCard: McpToolDefinition = {
     });
 
     log(`send_card: ${id}`);
+    const dropped = countCallbackActions(card);
+    if (dropped > 0) {
+      return ok(
+        `Card sent (id: ${id}). ${dropped} action(s) without a url were dropped: send_card never renders callback buttons on any channel. Use ask_user_question for buttons.`,
+      );
+    }
     return ok(`Card sent (id: ${id})`);
   },
 };

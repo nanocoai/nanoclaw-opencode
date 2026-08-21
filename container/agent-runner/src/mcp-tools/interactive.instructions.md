@@ -17,6 +17,6 @@ Use this when you genuinely cannot proceed without a decision. For free-text inp
 
 `mcp__nanoclaw__send_card({ card, fallbackText? })` renders a structured card and **returns immediately** — it does not pause your turn or collect a response.
 
-`card` supports: `title`, `description`, `children` (nested text or content blocks), and `actions` (buttons). `fallbackText` is sent as a plain message on platforms without card support.
+`card` supports: `title`, `description`, `children` (nested text or content blocks), and `actions`. An action needs a `url` and renders as a link button. Actions without a `url` are dropped on every channel (the tool result tells you how many). `send_card` never renders callback buttons; if you want a button the user can click, use `ask_user_question`. `fallbackText` is the plain-text version used on channels that render cards as text; it has nothing to do with buttons.
 
-Use this for presenting information in a cleaner format than prose: summaries, options the user can read (but you're not waiting on), or results with contextual buttons. If you need the user to actually *choose* something and return a value, use `ask_user_question` instead.
+Use this for presenting information in a cleaner format than prose: summaries, options the user can read (but you're not waiting on), or results with link buttons. If you need the user to actually *choose* something and return a value, use `ask_user_question` instead.
