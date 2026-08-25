@@ -451,8 +451,8 @@ async function main(): Promise<void> {
     if (agentProvider !== 'claude' && !providerEntry) {
       // A non-claude provider picked from the hard-wired list isn't wired in
       // this install yet — install it by applying its `/add-<name>` SKILL.md
-      // in-process via the directive engine (channel style, idempotent:
-      // self-skips if already installed), rebuild the image (the container step
+      // in-process via the directive engine (channel style, refresh-safe),
+      // rebuild the image (the container step
       // already ran, the CLI manifest just changed), then load the payload's
       // setup module so it self-registers.
       const skillDir = `.claude/skills/add-${agentProvider}`;
@@ -923,11 +923,11 @@ function sendChatMessage(message: string): Promise<void> {
 
 // Providers offered for install are hard-wired in trunk — an audited control
 // surface (no branch enumeration that anyone with write access could extend).
-// Codex is the only one offered here; opencode/ollama install via their own
-// /add-* skills. Each is installed by applying its `/add-<name>` SKILL.md
+// Each entry is installed by applying its `/add-<name>` SKILL.md
 // in-process via the directive engine.
 const INSTALLABLE_PROVIDERS = [
   { value: 'codex', label: 'Codex', hint: 'OpenAI — ChatGPT subscription or API key' },
+  { value: 'opencode', label: 'OpenCode', hint: 'OpenAI, OpenRouter, DeepSeek, or a local model' },
 ] as const;
 
 // `pickSavedByPreviousRun`: the .env bridge promoted a pick persisted by a

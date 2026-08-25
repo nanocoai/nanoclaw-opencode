@@ -108,3 +108,20 @@ describe('codex installs from its hard-wired /add-codex skill in-process', () =>
     expect(src).not.toContain('setup/add-codex.sh');
   });
 });
+
+describe('opencode installs from its hard-wired self-contained skill', () => {
+  it('ships the skill payload on main without a providers-branch fetch', () => {
+    const skill = read('.claude/skills/add-opencode/SKILL.md');
+    expect(skill).toContain('payload/container/agent-runner/src/providers/opencode.ts');
+    expect(skill).not.toContain('from-branch:providers');
+  });
+
+  it('is offered by setup and mapped by the standalone auth step', () => {
+    expect(read('setup/auto.ts')).toContain("{ value: 'opencode', label: 'OpenCode'");
+    expect(read('setup/provider-auth.ts')).toContain("opencode: '.claude/skills/add-opencode'");
+  });
+
+  it('refreshes an existing provider payload and version pins', () => {
+    expect(read('setup/providers/install.ts')).toContain("mode: 'refresh'");
+  });
+});
