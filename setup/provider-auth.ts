@@ -21,10 +21,10 @@ import './providers/index.js';
 // Hard-wired install skills — the audited control surface (no branch
 // enumeration). Each `/add-<name>` SKILL.md is idempotent and self-skips when
 // the payload is already wired; it is applied in-process via the directive
-// engine (no shell-out to a drift-prone setup/add-<name>.sh). Codex is the only
-// manifest-style provider today.
+// engine (no shell-out to a drift-prone setup/add-<name>.sh).
 const INSTALL_SKILLS: Record<string, string> = {
   codex: '.claude/skills/add-codex',
+  opencode: '.claude/skills/add-opencode',
 };
 
 export async function run(args: string[]): Promise<void> {

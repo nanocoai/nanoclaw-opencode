@@ -20,7 +20,8 @@
  *      setup flow already rebuilds the image and runs auth around this call, so
  *      we scope `exec` to apply only the file-mutating commands the engine emits
  *      (the `nc:copy from-branch` git fetch/show) and skip those heavyweight run
- *      directives. The fork-aware remote resolver mirrors slack.ts exactly.
+ *      directives. The fork-aware remote resolver remains available for skills
+ *      that carry remote copy directives; self-contained payloads do not use it.
  *
  * Returns the engine's ApplyResult so the caller can decide whether a rebuild is
  * warranted (a fresh install always applied something) and surface any step the
@@ -58,6 +59,10 @@ export async function applyProviderSkill(skillDir: string, projectRoot: string):
   // separately). No resolveInput is passed: absent ⇒ any prompt defers, which
   // is exactly the old defer-all stub's semantics with no stub to maintain.
   const result = await applySkill(skillDir, projectRoot, {
+    // Setup is also the upgrade path for an already-installed provider. Refresh
+    // replaces canonical payload files and updates exact dependency/manifest
+    // pins while preserving the directive engine's idempotent append behavior.
+    mode: 'refresh',
     exec: (cmd) => {
       if (isFlowOwnedCommand(cmd)) return; // build/test/auth are the flow's job
       execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
