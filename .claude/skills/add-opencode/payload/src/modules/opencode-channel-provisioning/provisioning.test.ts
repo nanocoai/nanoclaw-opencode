@@ -133,8 +133,9 @@ describe('OpenCode channel-created agent provisioning', () => {
     });
     await provisioner.handleResponse(context, response('opencode_provider:local'));
     expect(cards.at(-1)?.title).toContain('model');
+    expect(cards.at(-1)?.title).toContain('Local MLX');
     expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
-      expect.arrayContaining(['Selected Live Model', 'Next models', 'Search models']),
+      expect.arrayContaining(['Selected Live Model', 'Next models', 'Search models', 'Change provider']),
     );
     expect(cards.at(-1)?.options).toHaveLength(7);
     expect(createdBeforeConfirmation).toBe(false);
@@ -181,6 +182,9 @@ describe('OpenCode channel-created agent provisioning', () => {
       'fixture:owner',
     );
     expect(cards.at(-1)?.options?.map((option) => option.label)).toContain('Search again');
+    await provisioner.handleResponse(context, response('opencode_change_provider'));
+    expect(cards.at(-1)?.title).toContain('provider');
+    await provisioner.handleResponse(context, response('opencode_provider:local'));
     expect(await provisioner.handleResponse(context, response('connect:anchor'))).toBe(true);
     expect(createdBeforeConfirmation).toBe(false);
 

@@ -28,12 +28,13 @@ const CATALOG_PROVIDER_PREFIX = 'opencode_catalog_provider:';
 const MODEL_PREFIX = 'opencode_model:';
 const MODEL_PAGE_PREFIX = 'opencode_model_page:';
 const MODEL_SEARCH = 'opencode_search_models';
+const CHANGE_PROVIDER = 'opencode_change_provider';
 const BROWSE_PROVIDERS = 'opencode_browse_providers';
 const INLINE_LOCAL = 'opencode_inline_local';
 const CONFIRM = 'opencode_confirm_agent';
 const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
-const MODEL_PAGE_SIZE = 4;
+const MODEL_PAGE_SIZE = 3;
 const CATALOG_SEARCH = '__catalog_search__';
 const CATALOG_SELECTED_PREFIX = '__catalog__:';
 const MODEL_SEARCH_PROVIDER_PREFIX = '__model_search__:';
@@ -134,6 +135,28 @@ async function resolveProvider(id: string): Promise<OpenCodeModelProvider | unde
   return getProvider(id);
 }
 
+async function offerProviders(context: ChannelAgentProvisioningContext, agentName: string): Promise<void> {
+  const providers = await listProviders();
+  await context.deliverQuestion('☁️ Choose an OpenCode provider', `Which provider should "${agentName}" use?`, [
+    ...providers.map((provider) => ({
+      label: provider.name,
+      selectedLabel: `✅ ${provider.name}`,
+      value: `${PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+    })),
+    {
+      label: 'Browse OpenCode providers',
+      selectedLabel: '🔎 Searching providers…',
+      value: BROWSE_PROVIDERS,
+    },
+    {
+      label: 'Local or custom endpoint',
+      selectedLabel: '✅ Local or custom endpoint',
+      value: INLINE_LOCAL,
+    },
+    { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
+  ]);
+}
+
 async function offerProviderSearch(context: ChannelAgentProvisioningContext, query: string): Promise<void> {
   let catalog;
   try {
@@ -172,7 +195,7 @@ async function offerModels(
   const state = await getState(context.row.messaging_group_id);
   await updateState(context.row.messaging_group_id, { step: 'awaiting_model', providerId: provider.id, modelId: null });
   await context.deliverQuestion(
-    '🧠 Choose an OpenCode model',
+    `🧠 Choose a ${provider.name} model`,
     `Which model should "${state?.agent_name}" use? Page ${currentPage + 1} of ${lastPage + 1}.`,
     [
       ...visible.map((model) => ({
@@ -193,6 +216,7 @@ async function offerModels(
         ? [{ label: 'Next models', selectedLabel: '➡️ Next models', value: `${MODEL_PAGE_PREFIX}${currentPage + 1}` }]
         : []),
       { label: 'Search models', selectedLabel: '🔎 Search models', value: MODEL_SEARCH },
+      { label: 'Change provider', selectedLabel: '↩️ Change provider', value: CHANGE_PROVIDER },
       { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
     ],
   );
@@ -205,13 +229,14 @@ async function offerModelSearchResults(
 ): Promise<void> {
   const state = await getState(context.row.messaging_group_id);
   await updateState(context.row.messaging_group_id, { step: 'awaiting_model', providerId: provider.id, modelId: null });
-  await context.deliverQuestion('🧠 Choose an OpenCode model', `Search results for "${state?.agent_name}":`, [
-    ...models.slice(0, MAX_OPTIONS - 2).map((model) => ({
+  await context.deliverQuestion(`🧠 Choose a ${provider.name} model`, `Search results for "${state?.agent_name}":`, [
+    ...models.slice(0, MAX_OPTIONS - 3).map((model) => ({
       label: model.name,
       selectedLabel: `✅ ${model.name}`,
       value: `${MODEL_PREFIX}${encodeURIComponent(model.id)}`,
     })),
     { label: 'Search again', selectedLabel: '🔎 Search again', value: MODEL_SEARCH },
+    { label: 'Change provider', selectedLabel: '↩️ Change provider', value: CHANGE_PROVIDER },
     { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
   ]);
 }
@@ -240,26 +265,8 @@ registerChannelAgentProvisioner({
       return true;
     }
     if (state.step === 'awaiting_name') {
-      const providers = await listProviders();
       await updateState(context.row.messaging_group_id, { step: 'awaiting_provider', agentName: text, modelId: null });
-      await context.deliverQuestion('☁️ Choose an OpenCode provider', `Which provider should "${text}" use?`, [
-        ...providers.map((provider) => ({
-          label: provider.name,
-          selectedLabel: `✅ ${provider.name}`,
-          value: `${PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
-        })),
-        {
-          label: 'Browse OpenCode providers',
-          selectedLabel: '🔎 Searching providers…',
-          value: BROWSE_PROVIDERS,
-        },
-        {
-          label: 'Local or custom endpoint',
-          selectedLabel: '✅ Local or custom endpoint',
-          value: INLINE_LOCAL,
-        },
-        { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
-      ]);
+      await offerProviders(context, text);
       return true;
     }
     if (state.step === 'awaiting_provider' && state.provider_id === CATALOG_SEARCH) {
@@ -365,6 +372,12 @@ registerChannelAgentProvisioner({
       await context.deliverText(
         'Reply with the local or custom OpenAI-compatible base URL, including `/v1` (for example `http://host.docker.internal:8891/v1`).',
       );
+      return true;
+    }
+    if (payload.value === CHANGE_PROVIDER) {
+      if (state.step !== 'awaiting_model' || !state.agent_name) return true;
+      await updateState(context.row.messaging_group_id, { step: 'awaiting_provider', modelId: null });
+      await offerProviders(context, state.agent_name);
       return true;
     }
     if (payload.value.startsWith(CATALOG_PROVIDER_PREFIX)) {
