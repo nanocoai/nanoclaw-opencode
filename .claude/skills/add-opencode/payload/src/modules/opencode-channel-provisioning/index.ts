@@ -38,6 +38,7 @@ const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
 const MODEL_PAGE_SIZE = 3;
 const CATALOG_SEARCH = '__catalog_search__';
+const CATALOG_SEARCH_EXPLICIT = '__catalog_search_explicit__';
 const CATALOG_BROWSE = '__catalog_browse__';
 const CATALOG_SELECTED_PREFIX = '__catalog__:';
 const MODEL_SEARCH_PROVIDER_PREFIX = '__model_search__:';
@@ -324,6 +325,10 @@ registerChannelAgentProvisioner({
       return true;
     }
     if (state.step === 'awaiting_provider' && state.provider_id === CATALOG_SEARCH) {
+      await offerProviderCatalog(context);
+      return true;
+    }
+    if (state.step === 'awaiting_provider' && state.provider_id === CATALOG_SEARCH_EXPLICIT) {
       await offerProviderSearch(context, text);
       return true;
     }
@@ -421,7 +426,7 @@ registerChannelAgentProvisioner({
       if (state.step !== 'awaiting_provider') return true;
       await updateState(context.row.messaging_group_id, {
         step: 'awaiting_provider',
-        providerId: CATALOG_SEARCH,
+        providerId: CATALOG_SEARCH_EXPLICIT,
         modelId: null,
       });
       await context.deliverText('Reply with part of the OpenCode provider name or ID (for example `openrouter`).');
@@ -448,7 +453,9 @@ registerChannelAgentProvisioner({
     if (payload.value.startsWith(CATALOG_PROVIDER_PREFIX)) {
       if (
         state.step !== 'awaiting_provider' ||
-        (state.provider_id !== CATALOG_SEARCH && state.provider_id !== CATALOG_BROWSE)
+        (state.provider_id !== CATALOG_SEARCH &&
+          state.provider_id !== CATALOG_SEARCH_EXPLICIT &&
+          state.provider_id !== CATALOG_BROWSE)
       )
         return true;
       const providerId = decodeURIComponent(payload.value.slice(CATALOG_PROVIDER_PREFIX.length));

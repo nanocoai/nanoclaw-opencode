@@ -255,6 +255,17 @@ describe('OpenCode channel-created agent provisioning', () => {
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:1')).toBe(true);
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_search_providers')).toBe(true);
     expect(texts).toHaveLength(1);
+    await getDb().run(
+      `UPDATE opencode_channel_provisioning
+       SET step = 'awaiting_provider', provider_id = '__catalog_search__'
+       WHERE messaging_group_id = 'origin'`,
+    );
+    await provisioner.handleText(
+      context,
+      textEvent('legacy-provider-query', 'old forced search input'),
+      'fixture:owner',
+    );
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:1')).toBe(true);
     await provisioner.handleResponse(context, response('opencode_provider_page:1'));
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:0')).toBe(true);
     await provisioner.handleResponse(context, response('opencode_search_providers'));
