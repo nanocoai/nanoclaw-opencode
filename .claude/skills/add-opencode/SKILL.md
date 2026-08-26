@@ -117,8 +117,9 @@ When an unknown channel chooses **Connect new agent** and OpenCode is the
 instance default, the shared channel flow delegates to this skill. It asks for
 the name, then offers configured connections, a searchable live OpenCode
 provider catalog, and an inline local/custom endpoint path. It discovers models
-live, requires explicit confirmation, then stores the chosen model and provider
-settings on that new group before the first container starts. Catalog providers
+live and presents them as a paginated list; model search is an optional fallback,
+not a required step. It requires explicit confirmation, then stores the chosen
+model and provider settings on that new group before the first container starts. Catalog providers
 expect their credentials to be available through OneCLI; secrets never enter
 the wizard state. The durable wizard row survives host restarts and works
 through every channel adapter using the generic approval flow.

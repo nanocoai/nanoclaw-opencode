@@ -26,11 +26,14 @@ import './cli-resource.js';
 const PROVIDER_PREFIX = 'opencode_provider:';
 const CATALOG_PROVIDER_PREFIX = 'opencode_catalog_provider:';
 const MODEL_PREFIX = 'opencode_model:';
+const MODEL_PAGE_PREFIX = 'opencode_model_page:';
+const MODEL_SEARCH = 'opencode_search_models';
 const BROWSE_PROVIDERS = 'opencode_browse_providers';
 const INLINE_LOCAL = 'opencode_inline_local';
 const CONFIRM = 'opencode_confirm_agent';
 const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
+const MODEL_PAGE_SIZE = 4;
 const CATALOG_SEARCH = '__catalog_search__';
 const CATALOG_SELECTED_PREFIX = '__catalog__:';
 const INLINE_URL = '__inline_local_url__';
@@ -157,26 +160,54 @@ async function offerModels(
   context: ChannelAgentProvisioningContext,
   provider: OpenCodeModelProvider,
   models: DiscoveredOpenCodeModel[],
+  page = 0,
 ): Promise<void> {
-  if (models.length > MAX_OPTIONS) {
-    await updateState(context.row.messaging_group_id, {
-      step: 'awaiting_model_query',
-      providerId: provider.id,
-      modelId: null,
-    });
-    await context.deliverText(
-      `${provider.name} has ${models.length} models. Reply with part of the model name or ID to search.`,
-    );
-    return;
-  }
+  const lastPage = Math.max(0, Math.ceil(models.length / MODEL_PAGE_SIZE) - 1);
+  const currentPage = Math.min(Math.max(0, page), lastPage);
+  const visible = models.slice(currentPage * MODEL_PAGE_SIZE, (currentPage + 1) * MODEL_PAGE_SIZE);
   const state = await getState(context.row.messaging_group_id);
   await updateState(context.row.messaging_group_id, { step: 'awaiting_model', providerId: provider.id, modelId: null });
-  await context.deliverQuestion('🧠 Choose an OpenCode model', `Which model should "${state?.agent_name}" use?`, [
-    ...models.map((model) => ({
+  await context.deliverQuestion(
+    '🧠 Choose an OpenCode model',
+    `Which model should "${state?.agent_name}" use? Page ${currentPage + 1} of ${lastPage + 1}.`,
+    [
+      ...visible.map((model) => ({
+        label: model.name,
+        selectedLabel: `✅ ${model.name}`,
+        value: `${MODEL_PREFIX}${encodeURIComponent(model.id)}`,
+      })),
+      ...(currentPage > 0
+        ? [
+            {
+              label: 'Previous models',
+              selectedLabel: '⬅️ Previous models',
+              value: `${MODEL_PAGE_PREFIX}${currentPage - 1}`,
+            },
+          ]
+        : []),
+      ...(currentPage < lastPage
+        ? [{ label: 'Next models', selectedLabel: '➡️ Next models', value: `${MODEL_PAGE_PREFIX}${currentPage + 1}` }]
+        : []),
+      { label: 'Search models', selectedLabel: '🔎 Search models', value: MODEL_SEARCH },
+      { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
+    ],
+  );
+}
+
+async function offerModelSearchResults(
+  context: ChannelAgentProvisioningContext,
+  provider: OpenCodeModelProvider,
+  models: DiscoveredOpenCodeModel[],
+): Promise<void> {
+  const state = await getState(context.row.messaging_group_id);
+  await updateState(context.row.messaging_group_id, { step: 'awaiting_model', providerId: provider.id, modelId: null });
+  await context.deliverQuestion('🧠 Choose an OpenCode model', `Search results for "${state?.agent_name}":`, [
+    ...models.slice(0, MAX_OPTIONS - 2).map((model) => ({
       label: model.name,
       selectedLabel: `✅ ${model.name}`,
       value: `${MODEL_PREFIX}${encodeURIComponent(model.id)}`,
     })),
+    { label: 'Search again', selectedLabel: '🔎 Search again', value: MODEL_SEARCH },
     { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
   ]);
 }
@@ -290,7 +321,7 @@ registerChannelAgentProvisioner({
         await context.deliverText('No matching models. Reply with a different search term.');
         return true;
       }
-      await offerModels(context, provider, matches.slice(0, MAX_OPTIONS));
+      await offerModelSearchResults(context, provider, matches);
       return true;
     }
     return false;
@@ -352,6 +383,26 @@ registerChannelAgentProvisioner({
       if (!provider) return true;
       const models = await discover(context, provider);
       if (models) await offerModels(context, provider, models);
+      return true;
+    }
+    if (payload.value.startsWith(MODEL_PAGE_PREFIX)) {
+      if (state.step !== 'awaiting_model' || !state.provider_id) return true;
+      const provider = await resolveProvider(state.provider_id);
+      if (!provider) return true;
+      const models = await discover(context, provider);
+      if (!models) return true;
+      const page = Number(payload.value.slice(MODEL_PAGE_PREFIX.length));
+      await offerModels(context, provider, models, Number.isSafeInteger(page) ? page : 0);
+      return true;
+    }
+    if (payload.value === MODEL_SEARCH) {
+      if (state.step !== 'awaiting_model' || !state.provider_id) return true;
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_model_query',
+        providerId: state.provider_id,
+        modelId: null,
+      });
+      await context.deliverText('Reply with part of the model name or ID to search.');
       return true;
     }
     if (payload.value.startsWith(MODEL_PREFIX)) {

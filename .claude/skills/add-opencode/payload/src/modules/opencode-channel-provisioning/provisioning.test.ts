@@ -13,6 +13,13 @@ vi.mock('./model-discovery.js', () => ({
       outputLimit: 8192,
       inputModalities: 'text,image',
     },
+    ...Array.from({ length: 5 }, (_, index) => ({
+      id: `openai/browsable-model-${index + 2}`,
+      name: `Browsable Model ${index + 2}`,
+      contextLimit: 32768,
+      outputLimit: 4096,
+      inputModalities: 'text',
+    })),
   ]),
 }));
 
@@ -126,7 +133,16 @@ describe('OpenCode channel-created agent provisioning', () => {
     });
     await provisioner.handleResponse(context, response('opencode_provider:local'));
     expect(cards.at(-1)?.title).toContain('model');
+    expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
+      expect.arrayContaining(['Selected Live Model', 'Next models', 'Search models']),
+    );
+    expect(cards.at(-1)?.options).toHaveLength(7);
     expect(createdBeforeConfirmation).toBe(false);
+    await provisioner.handleResponse(context, response('opencode_model_page:1'));
+    expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
+      expect.arrayContaining(['Browsable Model 6', 'Previous models', 'Search models']),
+    );
+    await provisioner.handleResponse(context, response('opencode_model_page:0'));
     expect(await provisioner.handleResponse(context, response('connect:anchor'))).toBe(true);
     expect(createdBeforeConfirmation).toBe(false);
 
