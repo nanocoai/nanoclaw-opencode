@@ -1,5 +1,6 @@
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
+import type { PromptAttachment } from './providers/types.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
 
 /**
@@ -204,7 +205,7 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const linksSuffix = formatLinks(content.links, text);
-  const attachmentsSuffix = formatAttachments(content.attachments);
+  const attachmentsSuffix = formatAttachments(content.attachments, msg.id);
   const appContextSuffix = formatAppContext(content.app_context);
 
   const fromAttr = originAttr(msg);
@@ -352,19 +353,85 @@ function formatLinks(links: any[] | undefined, text: string): string {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatAttachments(attachments: any[] | undefined): string {
+function formatAttachments(attachments: any[] | undefined, messageId: string): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
   const parts = attachments.map((a) => {
-    const name = a.name || a.filename || 'attachment';
-    const type = a.type || 'file';
-    const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
-    const url = a.url || '';
+    if (!a || typeof a !== 'object') return '[file: attachment]';
+    const name =
+      typeof a.name === 'string' ? a.name : typeof a.filename === 'string' ? a.filename : 'attachment';
+    const type = typeof a.type === 'string' ? a.type : 'file';
+    // `localPath` is inbound JSON, not proof that the host staged a file.
+    // Render a readable path only when it is the canonical current-message
+    // inbox path built by session-manager; otherwise an attacker could steer
+    // the model into reading an unrelated workspace file through its tools.
+    const expectedLocalPath =
+      typeof a.name === 'string' &&
+      isSafeAttachmentComponent(a.name) &&
+      isSafeAttachmentComponent(messageId)
+        ? `inbox/${messageId}/${a.name}`
+        : '';
+    const localPath =
+      typeof a.localPath === 'string' && a.localPath === expectedLocalPath ? `/workspace/${expectedLocalPath}` : '';
+    const url = typeof a.url === 'string' ? a.url : '';
     if (localPath) {
       return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
     }
     return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
   });
   return '\n' + parts.join('\n');
+}
+
+/** True for a single safe path component (the host uses the same invariant). */
+function isSafeAttachmentComponent(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value !== '.' &&
+    value !== '..' &&
+    !value.includes('/') &&
+    !value.includes('\\') &&
+    !value.includes('\0')
+  );
+}
+
+/**
+ * Return the native-media view of attachments from exactly `messages`.
+ *
+ * Inbound content is untrusted JSON. Only host-staged files whose path binds
+ * the sanitized name to the current message id are accepted. Caller-supplied
+ * URLs and arbitrary `localPath` values never become provider file parts.
+ * The prompt rendering above remains the fallback for rejected entries.
+ */
+export function extractPromptAttachments(messages: MessageInRow[]): PromptAttachment[] {
+  const out: PromptAttachment[] = [];
+  for (const msg of messages) {
+    if (!isSafeAttachmentComponent(msg.id)) continue;
+    const content = parseContent(msg.content);
+    if (!Array.isArray(content.attachments)) continue;
+
+    for (const raw of content.attachments) {
+      if (!raw || typeof raw !== 'object') continue;
+      const attachment = raw as Record<string, unknown>;
+      const filename = attachment.name;
+      const localPath = attachment.localPath;
+      if (typeof filename !== 'string' || !isSafeAttachmentComponent(filename)) continue;
+      if (typeof localPath !== 'string') continue;
+
+      const expectedLocalPath = `inbox/${msg.id}/${filename}`;
+      if (localPath !== expectedLocalPath) continue;
+
+      out.push({
+        sourceMessageId: msg.id,
+        filename,
+        path: `/workspace/${expectedLocalPath}`,
+        ...(typeof attachment.mimeType === 'string' && attachment.mimeType.length > 0
+          ? { mime: attachment.mimeType }
+          : typeof attachment.mime === 'string' && attachment.mime.length > 0
+            ? { mime: attachment.mime }
+            : {}),
+      });
+    }
+  }
+  return out;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

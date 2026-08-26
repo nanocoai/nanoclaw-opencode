@@ -22,6 +22,8 @@ const PASSTHROUGH_KEYS = [
   'OPENCODE_MODEL_CONTEXT_LIMIT',
   'OPENCODE_MODEL_OUTPUT_LIMIT',
   'OPENCODE_MODEL_INPUT_MODALITIES',
+  'OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT',
+  'OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES',
 ] as const;
 
 function mergeNoProxy(current: string | undefined, additions: string): string {

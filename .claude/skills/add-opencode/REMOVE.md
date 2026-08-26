@@ -16,7 +16,8 @@ This reverses every persistent change made by `/add-opencode`.
 4. Delete the `opencode-ai` object from `container/cli-tools.json`.
 5. Remove OpenCode-only `.env` keys when unused: `OPENCODE_PROVIDER`,
    `OPENCODE_MODEL`, `OPENCODE_SMALL_MODEL`, the three
-   `OPENCODE_MODEL_*` capability/limit keys, and `ANTHROPIC_BASE_URL`.
+   `OPENCODE_MODEL_*` capability/limit keys, the two
+   `OPENCODE_NATIVE_ATTACHMENT_*` limit keys, and `ANTHROPIC_BASE_URL`.
 6. Switch every OpenCode group to an installed provider before rebuilding:
 
    ```bash

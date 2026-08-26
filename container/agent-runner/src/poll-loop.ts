@@ -19,6 +19,7 @@ import {
 } from './db/session-state.js';
 import {
   formatMessages,
+  extractPromptAttachments,
   extractRouting,
   categorizeMessage,
   isClearCommand,
@@ -223,6 +224,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const query = config.provider.query({
       prompt,
+      attachments: extractPromptAttachments(keep),
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -484,7 +486,7 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        query.push(prompt);
+        query.push(prompt, extractPromptAttachments(keep));
         archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {

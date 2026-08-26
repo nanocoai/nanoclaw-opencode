@@ -129,9 +129,14 @@ OpenCode runs in `/workspace/agent`, explicitly reads the composed
 `CLAUDE.md`, and keeps its SDK client scoped to that same directory. Session
 state is isolated per NanoClaw session under `opencode-xdg`.
 
-Attachments remain prompt text unless NanoClaw supplies structured attachment
-parts. Provider-side image/PDF handling is present and tested, but this skill
-does not claim missing core plumbing exists.
+Host-staged image/PDF attachments travel through NanoClaw's message-bound
+provider seam on both opening prompts and follow-up pushes. OpenCode rechecks
+that each file is a regular file inside the source message's inbox before
+creating a native file part. Native media defaults to at most 8 files and 25
+MiB total per prompt; `OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT` and
+`OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES` override those positive-integer limits.
+Rejected, remote-only, or unsupported attachments remain described in prompt
+text and are never fetched implicitly.
 
 ## Troubleshooting
 

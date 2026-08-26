@@ -95,9 +95,27 @@ export interface ProviderOptions {
   effort?: string;
 }
 
+/**
+ * A host-staged attachment belonging to one message in the provider prompt.
+ *
+ * The runner only emits entries whose path is the canonical inbox path for
+ * `sourceMessageId`. Providers may ignore this optional native-media view;
+ * every attachment remains described in the formatted prompt text.
+ */
+export interface PromptAttachment {
+  sourceMessageId: string;
+  filename: string;
+  /** Absolute path inside this session's /workspace mount. */
+  path: string;
+  mime?: string;
+}
+
 export interface QueryInput {
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
+
+  /** Host-staged attachments from the exact messages used to build `prompt`. */
+  attachments?: PromptAttachment[];
 
   /**
    * Opaque continuation token from a previous query. The provider decides
@@ -141,8 +159,8 @@ export type McpServerConfig =
   | { type: 'http'; url: string; headers?: Record<string, string> };
 
 export interface AgentQuery {
-  /** Push a follow-up message into the active query. */
-  push(message: string): void;
+  /** Push a follow-up and the host-staged attachments from that exact batch. */
+  push(message: string, attachments?: PromptAttachment[]): void;
 
   /** Signal that no more input will be sent. */
   end(): void;

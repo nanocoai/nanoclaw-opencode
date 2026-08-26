@@ -44,13 +44,19 @@ describe('opencode provider host registration', () => {
             contextLimit: 65536,
           },
         },
-        hostEnv: { OPENCODE_MODEL: 'openai/global-default' },
+        hostEnv: {
+          OPENCODE_MODEL: 'openai/global-default',
+          OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
+          OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
+        },
       });
       expect(contribution.env).toMatchObject({
         OPENCODE_MODEL: 'openai/selected-live-model',
         OPENCODE_PROVIDER: 'openai',
         ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
         OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
+        OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
+        OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
       });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
