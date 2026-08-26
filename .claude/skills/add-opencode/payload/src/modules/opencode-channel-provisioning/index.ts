@@ -36,7 +36,16 @@ const INLINE_LOCAL = 'opencode_inline_local';
 const CONFIRM = 'opencode_confirm_agent';
 const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
+const PRIMARY_PROVIDER_SLOTS = 5;
 const MODEL_PAGE_SIZE = 3;
+const RECOMMENDED_PROVIDERS = [
+  { id: 'opencode', name: 'OpenCode Zen' },
+  { id: 'openrouter', name: 'OpenRouter' },
+  { id: 'anthropic', name: 'Anthropic' },
+  { id: 'openai', name: 'OpenAI' },
+  { id: 'google', name: 'Google' },
+  { id: 'ollama', name: 'Ollama' },
+] as const;
 const CATALOG_SEARCH = '__catalog_search__';
 const CATALOG_SEARCH_EXPLICIT = '__catalog_search_explicit__';
 const CATALOG_BROWSE = '__catalog_browse__';
@@ -141,15 +150,32 @@ async function resolveProvider(id: string): Promise<OpenCodeModelProvider | unde
 
 async function offerProviders(context: ChannelAgentProvisioningContext, agentName: string): Promise<void> {
   const providers = await listProviders();
-  await context.deliverQuestion('☁️ Choose an OpenCode provider', `Which provider should "${agentName}" use?`, [
+  let catalogIds = new Set<string>();
+  try {
+    catalogIds = new Set((await discoverOpenCodeProviders()).map((provider) => provider.id));
+  } catch {
+    // Configured connections and the custom endpoint remain usable offline.
+  }
+  const configuredProviderIds = new Set(providers.map((provider) => provider.provider_id));
+  const primaryProviders = [
     ...providers.map((provider) => ({
       label: provider.name,
       selectedLabel: `✅ ${provider.name}`,
       value: `${PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
     })),
+    ...RECOMMENDED_PROVIDERS.filter(
+      (provider) => catalogIds.has(provider.id) && !configuredProviderIds.has(provider.id),
+    ).map((provider) => ({
+      label: provider.name,
+      selectedLabel: `✅ ${provider.name}`,
+      value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+    })),
+  ].slice(0, PRIMARY_PROVIDER_SLOTS);
+  await context.deliverQuestion('☁️ Choose an OpenCode provider', `Which provider should "${agentName}" use?`, [
+    ...primaryProviders,
     {
-      label: 'Browse OpenCode providers',
-      selectedLabel: '🔎 Searching providers…',
+      label: 'More providers…',
+      selectedLabel: '🔎 More providers…',
       value: BROWSE_PROVIDERS,
     },
     {
@@ -189,6 +215,7 @@ async function offerProviderSearch(context: ChannelAgentProvisioningContext, que
 }
 
 async function offerProviderCatalog(context: ChannelAgentProvisioningContext, page = 0): Promise<void> {
+  const configured = await listProviders();
   let catalog;
   try {
     catalog = await discoverOpenCodeProviders();
@@ -196,10 +223,22 @@ async function offerProviderCatalog(context: ChannelAgentProvisioningContext, pa
     await context.deliverText('Could not read the OpenCode provider catalog. Check network access and try again.');
     return;
   }
+  const choices = [
+    ...configured.map((provider) => ({
+      label: provider.name,
+      selectedLabel: `✅ ${provider.name}`,
+      value: `${PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+    })),
+    ...catalog.map((provider) => ({
+      label: provider.name,
+      selectedLabel: `✅ ${provider.name}`,
+      value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+    })),
+  ];
   const pageSize = 4;
-  const lastPage = Math.max(0, Math.ceil(catalog.length / pageSize) - 1);
+  const lastPage = Math.max(0, Math.ceil(choices.length / pageSize) - 1);
   const currentPage = Math.min(Math.max(0, page), lastPage);
-  const visible = catalog.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  const visible = choices.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
   await updateState(context.row.messaging_group_id, {
     step: 'awaiting_provider',
     providerId: CATALOG_BROWSE,
@@ -209,11 +248,7 @@ async function offerProviderCatalog(context: ChannelAgentProvisioningContext, pa
     '☁️ Choose an OpenCode provider',
     `Provider page ${currentPage + 1} of ${lastPage + 1}:`,
     [
-      ...visible.map((provider) => ({
-        label: provider.name,
-        selectedLabel: `✅ ${provider.name}`,
-        value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
-      })),
+      ...visible,
       ...(currentPage > 0
         ? [
             {
@@ -451,13 +486,7 @@ registerChannelAgentProvisioner({
       return true;
     }
     if (payload.value.startsWith(CATALOG_PROVIDER_PREFIX)) {
-      if (
-        state.step !== 'awaiting_provider' ||
-        (state.provider_id !== CATALOG_SEARCH &&
-          state.provider_id !== CATALOG_SEARCH_EXPLICIT &&
-          state.provider_id !== CATALOG_BROWSE)
-      )
-        return true;
+      if (state.step !== 'awaiting_provider') return true;
       const providerId = decodeURIComponent(payload.value.slice(CATALOG_PROVIDER_PREFIX.length));
       let catalog;
       try {

@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./model-discovery.js', () => ({
   discoverOpenCodeProviders: vi.fn().mockResolvedValue([
+    { id: 'opencode', name: 'OpenCode' },
     { id: 'anthropic', name: 'Anthropic' },
     { id: 'cerebras', name: 'Cerebras' },
     { id: 'openrouter', name: 'OpenRouter' },
     { id: 'deepseek', name: 'DeepSeek' },
     { id: 'google', name: 'Google' },
     { id: 'groq', name: 'Groq' },
+    { id: 'ollama', name: 'Ollama' },
   ]),
   discoverOpenCodeModels: vi.fn().mockResolvedValue([
     {
@@ -124,8 +126,9 @@ describe('OpenCode channel-created agent provisioning', () => {
     );
     expect(cards.at(-1)?.title).toContain('provider');
     expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
-      expect.arrayContaining(['Browse OpenCode providers', 'Local or custom endpoint']),
+      expect.arrayContaining(['Local MLX', 'OpenCode Zen', 'OpenRouter', 'More providers…', 'Local or custom endpoint']),
     );
+    expect(cards.at(-1)?.options).toHaveLength(8);
 
     const response = (value: string) => ({
       questionId: 'origin',
@@ -251,6 +254,8 @@ describe('OpenCode channel-created agent provisioning', () => {
 
     await provisioner.start(context);
     await provisioner.handleText(context, textEvent('name-catalog', 'Catalog Agent'), 'fixture:owner');
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_catalog_provider:opencode')).toBe(true);
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_catalog_provider:openrouter')).toBe(true);
     await provisioner.handleResponse(context, response('opencode_browse_providers'));
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:1')).toBe(true);
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_search_providers')).toBe(true);
