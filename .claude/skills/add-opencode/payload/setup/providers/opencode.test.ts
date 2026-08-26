@@ -3,7 +3,14 @@ import path from 'path';
 
 import { describe, expect, it } from 'vitest';
 
+import { normalizeOptionalInput } from './opencode.js';
+
 describe('OpenCode setup payload', () => {
+  it('accepts a blank optional API key for a keyless local endpoint', () => {
+    expect(normalizeOptionalInput(undefined)).toBe('');
+    expect(normalizeOptionalInput('  local-key  ')).toBe('local-key');
+  });
+
   it('keeps the verified runtime pin and trusted postinstall together', () => {
     const root = process.cwd();
     const tools = JSON.parse(fs.readFileSync(path.join(root, 'container/cli-tools.json'), 'utf8')) as Array<{
