@@ -56,4 +56,42 @@ describe('opencode provider host registration', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('clears inherited local endpoint defaults for a selected cloud provider', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-cloud-registration-'));
+    try {
+      const contribution = await getProviderContainerConfig('opencode')!({
+        sessionDir: root,
+        agentGroupId: 'cloud-group',
+        groupDir: root,
+        selectedSkills: [],
+        model: 'openrouter/provider/model',
+        providerSettings: {
+          opencode: {
+            modelProvider: 'openrouter',
+            baseUrl: null,
+            smallModel: 'openrouter/provider/model',
+            contextLimit: null,
+            outputLimit: null,
+            inputModalities: '',
+          },
+        },
+        hostEnv: {
+          ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
+          OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
+          OPENCODE_MODEL_OUTPUT_LIMIT: '8192',
+        },
+      });
+      expect(contribution.env).toMatchObject({
+        OPENCODE_MODEL: 'openrouter/provider/model',
+        OPENCODE_PROVIDER: 'openrouter',
+      });
+      expect(contribution.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+      expect(contribution.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBeUndefined();
+      expect(contribution.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
+      expect(contribution.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

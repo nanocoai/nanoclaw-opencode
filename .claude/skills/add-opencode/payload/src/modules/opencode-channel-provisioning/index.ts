@@ -18,16 +18,24 @@ import {
   syncEnvironmentProvider,
   updateState,
 } from './db.js';
-import { discoverOpenCodeModels } from './model-discovery.js';
+import { discoverOpenCodeModels, discoverOpenCodeProviders } from './model-discovery.js';
 import { opencodeChannelProvisioningMigration } from './migration.js';
 import type { DiscoveredOpenCodeModel, OpenCodeModelProvider } from './types.js';
 import './cli-resource.js';
 
 const PROVIDER_PREFIX = 'opencode_provider:';
+const CATALOG_PROVIDER_PREFIX = 'opencode_catalog_provider:';
 const MODEL_PREFIX = 'opencode_model:';
+const BROWSE_PROVIDERS = 'opencode_browse_providers';
+const INLINE_LOCAL = 'opencode_inline_local';
 const CONFIRM = 'opencode_confirm_agent';
 const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
+const CATALOG_SEARCH = '__catalog_search__';
+const CATALOG_SELECTED_PREFIX = '__catalog__:';
+const INLINE_URL = '__inline_local_url__';
+const INLINE_CONTEXT_PREFIX = '__inline_local_context__:';
+const INLINE_PROVIDER_PREFIX = '__inline_provider__:';
 
 registerMigration(opencodeChannelProvisioningMigration);
 
@@ -70,6 +78,79 @@ async function discover(context: ChannelAgentProvisioningContext, provider: Open
     await context.deliverText(`Could not read models from ${provider.name}. Check the connection and try again.`);
     return undefined;
   }
+}
+
+function virtualProvider(providerId: string, name: string): OpenCodeModelProvider {
+  const now = new Date().toISOString();
+  return {
+    id: `${CATALOG_SELECTED_PREFIX}${providerId}`,
+    name,
+    provider_id: providerId,
+    discovery_type: 'models-dev',
+    base_url: null,
+    models_url: null,
+    context_limit: null,
+    output_limit: null,
+    input_modalities: '',
+    instructions: null,
+    enabled: 1,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+function encodeInlineProvider(provider: OpenCodeModelProvider): string {
+  return `${INLINE_PROVIDER_PREFIX}${Buffer.from(JSON.stringify(provider)).toString('base64url')}`;
+}
+
+function decodeInlineProvider(value: string): OpenCodeModelProvider | undefined {
+  if (!value.startsWith(INLINE_PROVIDER_PREFIX)) return undefined;
+  try {
+    const provider = JSON.parse(
+      Buffer.from(value.slice(INLINE_PROVIDER_PREFIX.length), 'base64url').toString(),
+    ) as OpenCodeModelProvider;
+    // Keep the opaque durable state key when model search renders another card.
+    provider.id = value;
+    return provider;
+  } catch {
+    return undefined;
+  }
+}
+
+async function resolveProvider(id: string): Promise<OpenCodeModelProvider | undefined> {
+  const inline = decodeInlineProvider(id);
+  if (inline) return inline;
+  if (id.startsWith(CATALOG_SELECTED_PREFIX)) {
+    const providerId = id.slice(CATALOG_SELECTED_PREFIX.length);
+    return providerId ? virtualProvider(providerId, providerId) : undefined;
+  }
+  return getProvider(id);
+}
+
+async function offerProviderSearch(context: ChannelAgentProvisioningContext, query: string): Promise<void> {
+  let catalog;
+  try {
+    catalog = await discoverOpenCodeProviders();
+  } catch {
+    await context.deliverText('Could not read the OpenCode provider catalog. Check network access and try again.');
+    return;
+  }
+  const needle = query.trim().toLowerCase();
+  const matches = catalog
+    .filter((provider) => provider.id.toLowerCase().includes(needle) || provider.name.toLowerCase().includes(needle))
+    .slice(0, MAX_OPTIONS);
+  if (!matches.length) {
+    await context.deliverText('No matching OpenCode providers. Reply with another provider name or ID.');
+    return;
+  }
+  await context.deliverQuestion('☁️ Choose an OpenCode provider', `Providers matching “${query.trim()}”:`, [
+    ...matches.map((provider) => ({
+      label: provider.name,
+      selectedLabel: `✅ ${provider.name}`,
+      value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+    })),
+    { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
+  ]);
 }
 
 async function offerModels(
@@ -125,13 +206,6 @@ registerChannelAgentProvisioner({
     }
     if (state.step === 'awaiting_name') {
       const providers = await listProviders();
-      if (!providers.length) {
-        await context.deliverText(
-          'No OpenCode model-provider connections are configured. Add one with ncl opencode-model-providers create, then mention the bot again.',
-        );
-        await cancel(context);
-        return true;
-      }
       await updateState(context.row.messaging_group_id, { step: 'awaiting_provider', agentName: text, modelId: null });
       await context.deliverQuestion('☁️ Choose an OpenCode provider', `Which provider should "${text}" use?`, [
         ...providers.map((provider) => ({
@@ -139,12 +213,72 @@ registerChannelAgentProvisioner({
           selectedLabel: `✅ ${provider.name}`,
           value: `${PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
         })),
+        {
+          label: 'Browse OpenCode providers',
+          selectedLabel: '🔎 Searching providers…',
+          value: BROWSE_PROVIDERS,
+        },
+        {
+          label: 'Local or custom endpoint',
+          selectedLabel: '✅ Local or custom endpoint',
+          value: INLINE_LOCAL,
+        },
         { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
       ]);
       return true;
     }
+    if (state.step === 'awaiting_provider' && state.provider_id === CATALOG_SEARCH) {
+      await offerProviderSearch(context, text);
+      return true;
+    }
+    if (state.step === 'awaiting_provider' && state.provider_id === INLINE_URL) {
+      let baseUrl: string;
+      try {
+        if (text.length > 2048) throw new Error('URL too long');
+        const parsed = new URL(text);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') throw new Error('unsupported protocol');
+        parsed.hash = '';
+        parsed.search = '';
+        baseUrl = parsed.toString().replace(/\/$/, '');
+      } catch {
+        await context.deliverText('Enter a valid HTTP(S) base URL, including `/v1`.');
+        return true;
+      }
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_model_query',
+        providerId: `${INLINE_CONTEXT_PREFIX}${Buffer.from(baseUrl).toString('base64url')}`,
+        modelId: null,
+      });
+      await context.deliverText('Reply with the model context window in tokens (for example `32768` or `262144`).');
+      return true;
+    }
+    if (state.step === 'awaiting_model_query' && state.provider_id?.startsWith(INLINE_CONTEXT_PREFIX)) {
+      const contextLimit = Number(text);
+      if (!Number.isSafeInteger(contextLimit) || contextLimit < 1024) {
+        await context.deliverText('Enter a whole-number context window of at least 1024 tokens.');
+        return true;
+      }
+      const baseUrl = Buffer.from(state.provider_id.slice(INLINE_CONTEXT_PREFIX.length), 'base64url').toString();
+      const provider = virtualProvider('openai', `Local endpoint (${new URL(baseUrl).host})`);
+      provider.id = '__inline_local__';
+      provider.discovery_type = 'openai-compatible';
+      provider.base_url = baseUrl;
+      provider.context_limit = contextLimit;
+      provider.output_limit = Math.min(8192, Math.max(1024, Math.floor(contextLimit / 4)));
+      provider.input_modalities = 'text';
+      const encoded = encodeInlineProvider(provider);
+      provider.id = encoded;
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_model_query',
+        providerId: encoded,
+        modelId: null,
+      });
+      const models = await discover(context, provider);
+      if (models) await offerModels(context, provider, models);
+      return true;
+    }
     if (state.step === 'awaiting_model_query' && state.provider_id) {
-      const provider = await getProvider(state.provider_id);
+      const provider = await resolveProvider(state.provider_id);
       if (!provider) return true;
       const models = await discover(context, provider);
       if (!models) return true;
@@ -168,6 +302,50 @@ registerChannelAgentProvisioner({
       await cancel(context);
       return true;
     }
+    if (payload.value === BROWSE_PROVIDERS) {
+      if (state.step !== 'awaiting_provider') return true;
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_provider',
+        providerId: CATALOG_SEARCH,
+        modelId: null,
+      });
+      await context.deliverText('Reply with part of the OpenCode provider name or ID (for example `openrouter`).');
+      return true;
+    }
+    if (payload.value === INLINE_LOCAL) {
+      if (state.step !== 'awaiting_provider') return true;
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_provider',
+        providerId: INLINE_URL,
+        modelId: null,
+      });
+      await context.deliverText(
+        'Reply with the local or custom OpenAI-compatible base URL, including `/v1` (for example `http://host.docker.internal:8891/v1`).',
+      );
+      return true;
+    }
+    if (payload.value.startsWith(CATALOG_PROVIDER_PREFIX)) {
+      if (state.step !== 'awaiting_provider' || state.provider_id !== CATALOG_SEARCH) return true;
+      const providerId = decodeURIComponent(payload.value.slice(CATALOG_PROVIDER_PREFIX.length));
+      let catalog;
+      try {
+        catalog = await discoverOpenCodeProviders();
+      } catch {
+        await context.deliverText('Could not read the OpenCode provider catalog. Check network access and try again.');
+        return true;
+      }
+      const entry = catalog.find((provider) => provider.id === providerId);
+      if (!entry) return true;
+      const provider = virtualProvider(entry.id, entry.name);
+      await updateState(context.row.messaging_group_id, {
+        step: 'awaiting_provider',
+        providerId: provider.id,
+        modelId: null,
+      });
+      const models = await discover(context, provider);
+      if (models) await offerModels(context, provider, models);
+      return true;
+    }
     if (payload.value.startsWith(PROVIDER_PREFIX)) {
       if (state.step !== 'awaiting_provider') return true;
       const provider = await getProvider(decodeURIComponent(payload.value.slice(PROVIDER_PREFIX.length)));
@@ -178,7 +356,7 @@ registerChannelAgentProvisioner({
     }
     if (payload.value.startsWith(MODEL_PREFIX)) {
       if (state.step !== 'awaiting_model' || !state.provider_id || !state.agent_name) return true;
-      const provider = await getProvider(state.provider_id);
+      const provider = await resolveProvider(state.provider_id);
       if (!provider) return true;
       const models = await discover(context, provider);
       if (!models) return true;
@@ -195,7 +373,7 @@ registerChannelAgentProvisioner({
     if (payload.value === CONFIRM) {
       if (state.step !== 'awaiting_confirmation' || !state.agent_name || !state.provider_id || !state.model_id)
         return true;
-      const provider = await getProvider(state.provider_id);
+      const provider = await resolveProvider(state.provider_id);
       if (!provider) return true;
       const models = await discover(context, provider);
       const model = models?.find((entry) => entry.id === state.model_id);

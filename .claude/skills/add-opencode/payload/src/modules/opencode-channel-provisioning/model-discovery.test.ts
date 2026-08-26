@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { discoverOpenCodeModels } from './model-discovery.js';
+import { discoverOpenCodeModels, discoverOpenCodeProviders } from './model-discovery.js';
 import type { OpenCodeModelProvider } from './types.js';
 
 function provider(overrides: Partial<OpenCodeModelProvider> = {}): OpenCodeModelProvider {
@@ -50,6 +50,27 @@ describe('OpenCode live model discovery', () => {
     const models = await discoverOpenCodeModels(provider({ discovery_type: 'models-dev', base_url: null }), fetchImpl);
     expect(models).toEqual([
       { id: 'openai/gpt-live', name: 'GPT Live', contextLimit: 128000, outputLimit: 8192, inputModalities: 'text' },
+    ]);
+  });
+
+  it('discovers and sorts the live OpenCode provider catalog from Models.dev', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          zeta: { name: 'Zeta', models: { one: { limit: { context: 32000 } } } },
+          empty: { name: 'Empty', models: {} },
+          audio: {
+            name: 'Audio only',
+            models: { speech: { modalities: { output: ['audio'] }, limit: { context: 32000 } } },
+          },
+          alpha: { name: 'Alpha AI', models: { two: { limit: { context: 128000 } } } },
+        }),
+        { status: 200 },
+      ),
+    );
+    await expect(discoverOpenCodeProviders(fetchImpl)).resolves.toEqual([
+      { id: 'alpha', name: 'Alpha AI' },
+      { id: 'zeta', name: 'Zeta' },
     ]);
   });
 });

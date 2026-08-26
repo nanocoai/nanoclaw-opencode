@@ -39,6 +39,37 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
   return [...parts].join(',');
 }
 
+interface OpenCodeProviderSettings {
+  modelProvider?: unknown;
+  baseUrl?: unknown;
+  smallModel?: unknown;
+  contextLimit?: unknown;
+  outputLimit?: unknown;
+  inputModalities?: unknown;
+}
+
+/** Apply group-owned settings over service defaults; invalid values fail closed to unset. */
+export function applyOpenCodeProviderSettings(env: Record<string, string>, settings: OpenCodeProviderSettings): void {
+  const setString = (property: keyof OpenCodeProviderSettings, envKey: string) => {
+    if (!(property in settings)) return;
+    const value = settings[property];
+    if (typeof value === 'string' && value.trim()) env[envKey] = value;
+    else delete env[envKey];
+  };
+  const setPositiveInteger = (property: keyof OpenCodeProviderSettings, envKey: string) => {
+    if (!(property in settings)) return;
+    const value = settings[property];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) env[envKey] = String(value);
+    else delete env[envKey];
+  };
+  setString('modelProvider', 'OPENCODE_PROVIDER');
+  setString('baseUrl', 'ANTHROPIC_BASE_URL');
+  setString('smallModel', 'OPENCODE_SMALL_MODEL');
+  setPositiveInteger('contextLimit', 'OPENCODE_MODEL_CONTEXT_LIMIT');
+  setPositiveInteger('outputLimit', 'OPENCODE_MODEL_OUTPUT_LIMIT');
+  setString('inputModalities', 'OPENCODE_MODEL_INPUT_MODALITIES');
+}
+
 registerProviderContainerConfig('opencode', (ctx) => {
   const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
   fs.mkdirSync(opencodeDir, { recursive: true });
@@ -66,14 +97,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const opencode =
     typeof settings === 'object' && settings !== null ? (settings as Record<string, unknown>) : undefined;
   if (ctx.model) env.OPENCODE_MODEL = ctx.model;
-  if (typeof opencode?.modelProvider === 'string') env.OPENCODE_PROVIDER = opencode.modelProvider;
-  if (typeof opencode?.baseUrl === 'string' && opencode.baseUrl) env.ANTHROPIC_BASE_URL = opencode.baseUrl;
-  if (typeof opencode?.smallModel === 'string') env.OPENCODE_SMALL_MODEL = opencode.smallModel;
-  if (typeof opencode?.contextLimit === 'number') env.OPENCODE_MODEL_CONTEXT_LIMIT = String(opencode.contextLimit);
-  if (typeof opencode?.outputLimit === 'number') env.OPENCODE_MODEL_OUTPUT_LIMIT = String(opencode.outputLimit);
-  if (typeof opencode?.inputModalities === 'string') {
-    env.OPENCODE_MODEL_INPUT_MODALITIES = opencode.inputModalities;
-  }
+  if (opencode) applyOpenCodeProviderSettings(env, opencode);
 
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],

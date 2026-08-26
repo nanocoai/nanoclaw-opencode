@@ -22,6 +22,11 @@ export interface DiscoveredOpenCodeModel {
   inputModalities: string;
 }
 
+export interface DiscoveredOpenCodeProvider {
+  id: string;
+  name: string;
+}
+
 export type ProvisioningStep =
   | 'awaiting_name'
   | 'awaiting_provider'

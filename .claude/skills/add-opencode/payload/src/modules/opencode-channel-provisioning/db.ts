@@ -52,7 +52,10 @@ export async function getState(messagingGroupId: string): Promise<OpenCodeProvis
 export async function pendingTextInputFor(approverUserId: string): Promise<string | undefined> {
   const row = await getDb().get<{ messaging_group_id: string }>(
     `SELECT messaging_group_id FROM opencode_channel_provisioning
-      WHERE approver_user_id = ? AND step IN ('awaiting_name', 'awaiting_model_query')
+      WHERE approver_user_id = ? AND (
+        step IN ('awaiting_name', 'awaiting_model_query')
+        OR (step = 'awaiting_provider' AND provider_id IN ('__catalog_search__', '__inline_local_url__'))
+      )
       ORDER BY created_at, messaging_group_id LIMIT 1`,
     approverUserId,
   );

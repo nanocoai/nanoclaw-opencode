@@ -1,17 +1,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./model-discovery.js', () => ({
-  discoverOpenCodeModels: vi
-    .fn()
-    .mockResolvedValue([
-      {
-        id: 'openai/selected-live-model',
-        name: 'Selected Live Model',
-        contextLimit: 65536,
-        outputLimit: 8192,
-        inputModalities: 'text,image',
-      },
-    ]),
+  discoverOpenCodeProviders: vi.fn().mockResolvedValue([
+    { id: 'openrouter', name: 'OpenRouter' },
+    { id: 'deepseek', name: 'DeepSeek' },
+  ]),
+  discoverOpenCodeModels: vi.fn().mockResolvedValue([
+    {
+      id: 'openai/selected-live-model',
+      name: 'Selected Live Model',
+      contextLimit: 65536,
+      outputLimit: 8192,
+      inputModalities: 'text,image',
+    },
+  ]),
 }));
 
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
@@ -65,12 +67,12 @@ describe('OpenCode channel-created agent provisioning', () => {
       'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
       'origin',
     ))!;
-    const cards: Array<{ title: string }> = [];
+    const cards: Array<{ title: string; options?: Array<{ label?: string; value?: string }> }> = [];
     let createdBeforeConfirmation = false;
     const context: ChannelAgentProvisioningContext = {
       row,
-      deliverQuestion: async (title) => {
-        cards.push({ title });
+      deliverQuestion: async (title, _question, options) => {
+        cards.push({ title, options: options as Array<{ label?: string; value?: string }> });
         return true;
       },
       deliverText: async () => {},
@@ -110,6 +112,9 @@ describe('OpenCode channel-created agent provisioning', () => {
       'fixture:owner',
     );
     expect(cards.at(-1)?.title).toContain('provider');
+    expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
+      expect.arrayContaining(['Browse OpenCode providers', 'Local or custom endpoint']),
+    );
 
     const response = (value: string) => ({
       questionId: 'origin',
@@ -134,6 +139,135 @@ describe('OpenCode channel-created agent provisioning', () => {
     expect(config).toMatchObject({ provider: 'opencode', model: 'openai/selected-live-model' });
     expect(JSON.parse(config!.provider_settings!)).toMatchObject({
       opencode: { modelProvider: 'openai', baseUrl: 'http://host.docker.internal:8891/v1', contextLimit: 65536 },
+    });
+  });
+
+  it('searches the live provider catalog and persists a provider that was not preconfigured', async () => {
+    const row = (await getDb().get<PendingChannelApproval>(
+      'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
+      'origin',
+    ))!;
+    const cards: Array<{ title: string; options: Array<{ value?: string }> }> = [];
+    const texts: string[] = [];
+    const context: ChannelAgentProvisioningContext = {
+      row,
+      deliverQuestion: async (title, _question, options) => {
+        cards.push({ title, options: options as Array<{ value?: string }> });
+        return true;
+      },
+      deliverText: async (text) => void texts.push(text),
+      createAgent: async ({ name, provider, model }) => {
+        await createAgentGroup({
+          id: 'catalog-created',
+          name,
+          folder: 'catalog',
+          agent_provider: null,
+          created_at: now(),
+        });
+        await ensureContainerConfig('catalog-created', provider);
+        await updateContainerConfigScalars('catalog-created', { provider, model });
+        return (await getDb().get('SELECT * FROM agent_groups WHERE id = ?', 'catalog-created'))!;
+      },
+      wireAgent: async () => true,
+      cancel: async () => {},
+    };
+    const provisioner = getChannelAgentProvisioner('opencode')!;
+    const response = (value: string) => ({
+      questionId: 'origin',
+      value,
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      userId: 'owner',
+    });
+    const textEvent = (id: string, text: string) => ({
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      message: { id, kind: 'chat-sdk' as const, content: JSON.stringify({ text }), timestamp: now() },
+    });
+
+    await provisioner.start(context);
+    await provisioner.handleText(context, textEvent('name-catalog', 'Catalog Agent'), 'fixture:owner');
+    await provisioner.handleResponse(context, response('opencode_browse_providers'));
+    expect(texts.at(-1)).toContain('provider name');
+    expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
+
+    await provisioner.handleText(context, textEvent('provider-search', 'router'), 'fixture:owner');
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_catalog_provider:openrouter')).toBe(true);
+    await provisioner.handleResponse(context, response('opencode_catalog_provider:openrouter'));
+    await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
+    await provisioner.handleResponse(context, response('opencode_confirm_agent'));
+
+    const config = await getContainerConfig('catalog-created');
+    expect(config).toMatchObject({ provider: 'opencode', model: 'openai/selected-live-model' });
+    expect(JSON.parse(config!.provider_settings!)).toMatchObject({
+      opencode: { modelProvider: 'openrouter', baseUrl: null },
+    });
+  });
+
+  it('keeps inline local endpoint input durable and snapshots it into the new group', async () => {
+    const row = (await getDb().get<PendingChannelApproval>(
+      'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
+      'origin',
+    ))!;
+    const texts: string[] = [];
+    const context: ChannelAgentProvisioningContext = {
+      row,
+      deliverQuestion: async () => true,
+      deliverText: async (text) => void texts.push(text),
+      createAgent: async ({ name, provider, model }) => {
+        await createAgentGroup({
+          id: 'inline-created',
+          name,
+          folder: 'inline',
+          agent_provider: null,
+          created_at: now(),
+        });
+        await ensureContainerConfig('inline-created', provider);
+        await updateContainerConfigScalars('inline-created', { provider, model });
+        return (await getDb().get('SELECT * FROM agent_groups WHERE id = ?', 'inline-created'))!;
+      },
+      wireAgent: async () => true,
+      cancel: async () => {},
+    };
+    const provisioner = getChannelAgentProvisioner('opencode')!;
+    const response = (value: string) => ({
+      questionId: 'origin',
+      value,
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      userId: 'owner',
+    });
+    const textEvent = (id: string, text: string) => ({
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      message: { id, kind: 'chat-sdk' as const, content: JSON.stringify({ text }), timestamp: now() },
+    });
+
+    await provisioner.start(context);
+    await provisioner.handleText(context, textEvent('name-inline', 'Inline Agent'), 'fixture:owner');
+    await provisioner.handleResponse(context, response('opencode_inline_local'));
+    await provisioner.handleText(
+      context,
+      textEvent('url-inline', 'http://host.docker.internal:9911/v1'),
+      'fixture:owner',
+    );
+    expect(texts.at(-1)).toContain('context window');
+    expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
+    await provisioner.handleText(context, textEvent('context-inline', '131072'), 'fixture:owner');
+    await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
+    await provisioner.handleResponse(context, response('opencode_confirm_agent'));
+
+    const config = await getContainerConfig('inline-created');
+    expect(JSON.parse(config!.provider_settings!)).toMatchObject({
+      opencode: {
+        modelProvider: 'openai',
+        baseUrl: 'http://host.docker.internal:9911/v1',
+        contextLimit: 65536,
+      },
     });
   });
 });

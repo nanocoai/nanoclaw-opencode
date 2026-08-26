@@ -115,10 +115,13 @@ not require a memory migration. `/migrate-memory` is only for legacy formats.
 
 When an unknown channel chooses **Connect new agent** and OpenCode is the
 instance default, the shared channel flow delegates to this skill. It asks for
-the name and connection, discovers models live, requires explicit confirmation,
-then stores the chosen model and connection settings on that new group before
-the first container starts. The durable wizard row survives host restarts and
-works through every channel adapter using the generic approval flow.
+the name, then offers configured connections, a searchable live OpenCode
+provider catalog, and an inline local/custom endpoint path. It discovers models
+live, requires explicit confirmation, then stores the chosen model and provider
+settings on that new group before the first container starts. Catalog providers
+expect their credentials to be available through OneCLI; secrets never enter
+the wizard state. The durable wizard row survives host restarts and works
+through every channel adapter using the generic approval flow.
 
 OpenCode runs in `/workspace/agent`, explicitly reads the composed
 `CLAUDE.md`, and keeps its SDK client scoped to that same directory. Session

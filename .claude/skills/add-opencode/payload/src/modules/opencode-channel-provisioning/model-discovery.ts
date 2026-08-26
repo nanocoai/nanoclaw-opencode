@@ -1,5 +1,5 @@
 import { execFile } from 'child_process';
-import type { DiscoveredOpenCodeModel, OpenCodeModelProvider } from './types.js';
+import type { DiscoveredOpenCodeModel, DiscoveredOpenCodeProvider, OpenCodeModelProvider } from './types.js';
 
 const MODELS_DEV_URL = 'https://models.dev/api.json';
 const MAX_DISCOVERY_BYTES = 8 * 1024 * 1024;
@@ -98,6 +98,30 @@ function modelsDev(provider: OpenCodeModelProvider, payload: unknown): Discovere
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function providerCatalog(payload: unknown): DiscoveredOpenCodeProvider[] {
+  if (typeof payload !== 'object' || payload === null) throw new Error('Models.dev returned an invalid catalog');
+  return Object.entries(payload as Record<string, unknown>)
+    .flatMap(([id, raw]) => {
+      if (typeof raw !== 'object' || raw === null) return [];
+      const entry = raw as Record<string, unknown>;
+      const models = entry.models;
+      if (typeof models !== 'object' || models === null) return [];
+      const hasUsableTextModel = Object.values(models).some((model) => {
+        if (typeof model !== 'object' || model === null) return false;
+        const item = model as Record<string, unknown>;
+        const outputs = ((item.modalities as Record<string, unknown> | undefined)?.output ?? ['text']) as unknown;
+        return (
+          Array.isArray(outputs) &&
+          outputs.includes('text') &&
+          positiveInteger((item.limit as Record<string, unknown> | undefined)?.context) !== null
+        );
+      });
+      if (!hasUsableTextModel) return [];
+      return [{ id, name: typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : id }];
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function openAi(provider: OpenCodeModelProvider, payload: unknown): DiscoveredOpenCodeModel[] {
   const data = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>).data : undefined;
   if (!Array.isArray(data)) throw new Error('OpenAI-compatible model discovery must return a data array');
@@ -146,4 +170,10 @@ export async function discoverOpenCodeModels(
         );
   if (!result.length) throw new Error(`No text models were discovered for ${provider.name}`);
   return result;
+}
+
+export async function discoverOpenCodeProviders(
+  fetchImpl: FetchLike = globalThis.fetch,
+): Promise<DiscoveredOpenCodeProvider[]> {
+  return providerCatalog(await fetchJson(MODELS_DEV_URL, false, fetchImpl));
 }
