@@ -143,6 +143,44 @@ describe('OpenCode channel-created agent provisioning', () => {
       expect.arrayContaining(['Browsable Model 6', 'Previous models', 'Search models']),
     );
     await provisioner.handleResponse(context, response('opencode_model_page:0'));
+    await getDb().run(
+      `UPDATE opencode_channel_provisioning
+       SET step = 'awaiting_model_query', provider_id = 'local'
+       WHERE messaging_group_id = 'origin'`,
+    );
+    await provisioner.handleText(
+      context,
+      {
+        channelType: 'fixture',
+        platformId: 'owner-dm',
+        threadId: null,
+        message: {
+          id: 'legacy-query',
+          kind: 'chat-sdk',
+          content: JSON.stringify({ text: 'old forced search input' }),
+          timestamp: now(),
+        },
+      },
+      'fixture:owner',
+    );
+    expect(cards.at(-1)?.options?.map((option) => option.label)).toContain('Next models');
+    await provisioner.handleResponse(context, response('opencode_search_models'));
+    await provisioner.handleText(
+      context,
+      {
+        channelType: 'fixture',
+        platformId: 'owner-dm',
+        threadId: null,
+        message: {
+          id: 'explicit-query',
+          kind: 'chat-sdk',
+          content: JSON.stringify({ text: 'selected' }),
+          timestamp: now(),
+        },
+      },
+      'fixture:owner',
+    );
+    expect(cards.at(-1)?.options?.map((option) => option.label)).toContain('Search again');
     expect(await provisioner.handleResponse(context, response('connect:anchor'))).toBe(true);
     expect(createdBeforeConfirmation).toBe(false);
 

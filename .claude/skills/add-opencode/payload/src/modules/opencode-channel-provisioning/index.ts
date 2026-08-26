@@ -36,6 +36,7 @@ const MAX_OPTIONS = 8;
 const MODEL_PAGE_SIZE = 4;
 const CATALOG_SEARCH = '__catalog_search__';
 const CATALOG_SELECTED_PREFIX = '__catalog__:';
+const MODEL_SEARCH_PROVIDER_PREFIX = '__model_search__:';
 const INLINE_URL = '__inline_local_url__';
 const INLINE_CONTEXT_PREFIX = '__inline_local_context__:';
 const INLINE_PROVIDER_PREFIX = '__inline_provider__:';
@@ -121,6 +122,9 @@ function decodeInlineProvider(value: string): OpenCodeModelProvider | undefined 
 }
 
 async function resolveProvider(id: string): Promise<OpenCodeModelProvider | undefined> {
+  if (id.startsWith(MODEL_SEARCH_PROVIDER_PREFIX)) {
+    return resolveProvider(id.slice(MODEL_SEARCH_PROVIDER_PREFIX.length));
+  }
   const inline = decodeInlineProvider(id);
   if (inline) return inline;
   if (id.startsWith(CATALOG_SELECTED_PREFIX)) {
@@ -313,6 +317,14 @@ registerChannelAgentProvisioner({
       if (!provider) return true;
       const models = await discover(context, provider);
       if (!models) return true;
+      // Versions before the model browser stored the provider directly when
+      // they forced large catalogs into text search. Reopen those in-flight
+      // wizards as a browsable list; only the explicit search action below
+      // writes the sentinel that makes text act as a query.
+      if (!state.provider_id.startsWith(MODEL_SEARCH_PROVIDER_PREFIX)) {
+        await offerModels(context, provider, models);
+        return true;
+      }
       const query = text.toLowerCase();
       const matches = models.filter(
         (model) => model.id.toLowerCase().includes(query) || model.name.toLowerCase().includes(query),
@@ -399,7 +411,7 @@ registerChannelAgentProvisioner({
       if (state.step !== 'awaiting_model' || !state.provider_id) return true;
       await updateState(context.row.messaging_group_id, {
         step: 'awaiting_model_query',
-        providerId: state.provider_id,
+        providerId: `${MODEL_SEARCH_PROVIDER_PREFIX}${state.provider_id}`,
         modelId: null,
       });
       await context.deliverText('Reply with part of the model name or ID to search.');
