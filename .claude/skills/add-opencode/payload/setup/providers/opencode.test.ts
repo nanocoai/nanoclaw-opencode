@@ -1,14 +1,34 @@
 import fs from 'fs';
 import path from 'path';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import { normalizeOptionalInput } from './opencode.js';
+import { discoverLocalModelIds, normalizeOptionalInput } from './opencode.js';
 
 describe('OpenCode setup payload', () => {
   it('accepts a blank optional API key for a keyless local endpoint', () => {
     expect(normalizeOptionalInput(undefined)).toBe('');
     expect(normalizeOptionalInput('  local-key  ')).toBe('local-key');
+  });
+
+  it('discovers, trims, sorts, and deduplicates OpenAI-compatible model ids', async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response(JSON.stringify({ data: [{ id: 'qwen-b' }, { id: ' qwen-a ' }, { id: 'qwen-b' }, {}] })),
+    );
+
+    await expect(discoverLocalModelIds('http://host.docker.internal:8891/v1/', fetchImpl)).resolves.toEqual([
+      'qwen-a',
+      'qwen-b',
+    ]);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      new URL('http://127.0.0.1:8891/v1/models'),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it('rejects malformed model discovery responses so the wizard can fall back to manual input', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ models: [] })));
+    await expect(discoverLocalModelIds('http://127.0.0.1:8891/v1', fetchImpl)).rejects.toThrow('no data array');
   });
 
   it('keeps the verified runtime pin and trusted postinstall together', () => {

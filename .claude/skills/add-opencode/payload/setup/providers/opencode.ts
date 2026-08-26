@@ -12,6 +12,9 @@ import { registerSetupProvider } from './registry.js';
 
 type Backend = 'local' | 'openrouter' | 'deepseek' | 'custom' | 'skip';
 
+const MAX_MODEL_DISCOVERY_BYTES = 1024 * 1024;
+const MANUAL_MODEL = '__manual_model__';
+
 function answer<T>(value: T | symbol): T {
   if (p.isCancel(value)) {
     p.cancel('Setup cancelled.');
@@ -33,6 +36,48 @@ function validHttpUrl(value: string): string | undefined {
 /** Clack returns undefined when an optional password prompt is submitted blank. */
 export function normalizeOptionalInput(value: string | undefined): string {
   return value?.trim() ?? '';
+}
+
+/** Probe a container-facing OpenAI-compatible URL from the host setup process. */
+export async function discoverLocalModelIds(
+  baseUrl: string,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<string[]> {
+  const url = new URL(baseUrl);
+  if (url.hostname === 'host.docker.internal') url.hostname = '127.0.0.1';
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  url.search = '';
+  url.hash = '';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetchImpl(url, { signal: controller.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_MODEL_DISCOVERY_BYTES) {
+      throw new Error('response is too large');
+    }
+    const body = await response.text();
+    if (Buffer.byteLength(body, 'utf8') > MAX_MODEL_DISCOVERY_BYTES) throw new Error('response is too large');
+    const payload = JSON.parse(body) as unknown;
+    if (!payload || typeof payload !== 'object' || !Array.isArray((payload as Record<string, unknown>).data)) {
+      throw new Error('response has no data array');
+    }
+    return [
+      ...new Set(
+        ((payload as Record<string, unknown>).data as unknown[])
+          .flatMap((entry) => {
+            if (!entry || typeof entry !== 'object') return [];
+            const id = (entry as Record<string, unknown>).id;
+            return typeof id === 'string' && id.trim() ? [id.trim()] : [];
+          })
+          .sort((a, b) => a.localeCompare(b)),
+      ),
+    ];
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function saveKey(name: string, key: string, host: string): void {
@@ -122,13 +167,41 @@ export async function runOpenCodeAuthStep(): Promise<void> {
     host = baseUrl ? new URL(baseUrl).hostname : '';
   }
 
-  const model = answer(
-    await p.text({
-      message: 'Model id in provider/model form',
-      placeholder: provider === 'openai' ? 'openai/my-model' : `${provider}/model-id`,
-      validate: (value) => (String(value ?? '').includes('/') ? undefined : 'Use provider/model-id form.'),
-    }),
-  ).trim();
+  let discoveredModels: string[] = [];
+  if (backend === 'local') {
+    try {
+      discoveredModels = await discoverLocalModelIds(baseUrl);
+    } catch (error) {
+      p.log.warn(
+        brandBody(
+          `Could not list models from this endpoint (${error instanceof Error ? error.message : String(error)}). Enter the model id manually.`,
+        ),
+      );
+    }
+  }
+
+  let model = '';
+  if (discoveredModels.length > 0) {
+    const selected = answer(
+      await brightSelect<string>({
+        message: 'Which model should OpenCode use?',
+        options: [
+          ...discoveredModels.map((id) => ({ value: id, label: id })),
+          { value: MANUAL_MODEL, label: 'Enter a model id manually', hint: 'use a model not listed above' },
+        ],
+      }),
+    );
+    if (selected !== MANUAL_MODEL) model = `${provider}/${selected}`;
+  }
+  if (!model) {
+    model = answer(
+      await p.text({
+        message: 'Model id in provider/model form',
+        placeholder: provider === 'openai' ? 'openai/my-model' : `${provider}/model-id`,
+        validate: (value) => (String(value ?? '').includes('/') ? undefined : 'Use provider/model-id form.'),
+      }),
+    ).trim();
+  }
 
   upsertEnvVar('OPENCODE_PROVIDER', provider);
   upsertEnvVar('OPENCODE_MODEL', model);
