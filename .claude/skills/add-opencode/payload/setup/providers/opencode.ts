@@ -30,6 +30,11 @@ function validHttpUrl(value: string): string | undefined {
   return 'Enter an absolute http(s) URL.';
 }
 
+/** Clack returns undefined when an optional password prompt is submitted blank. */
+export function normalizeOptionalInput(value: string | undefined): string {
+  return value?.trim() ?? '';
+}
+
 function saveKey(name: string, key: string, host: string): void {
   execFileSync(
     'onecli',
@@ -131,13 +136,15 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   if (baseUrl) upsertEnvVar('ANTHROPIC_BASE_URL', baseUrl);
   else removeEnvVar('ANTHROPIC_BASE_URL');
 
-  const key = answer(
-    await p.password({
-      message: backend === 'local' ? 'API key (leave blank if this endpoint is keyless)' : 'API key',
-      validate: (value) =>
-        (backend !== 'openrouter' && backend !== 'deepseek') || String(value ?? '').trim() ? undefined : 'Required.',
-    }),
-  ).trim();
+  const key = normalizeOptionalInput(
+    answer(
+      await p.password({
+        message: backend === 'local' ? 'API key (leave blank if this endpoint is keyless)' : 'API key',
+        validate: (value) =>
+          (backend !== 'openrouter' && backend !== 'deepseek') || String(value ?? '').trim() ? undefined : 'Required.',
+      }),
+    ),
+  );
   if (key) {
     if (!host) {
       host = answer(
