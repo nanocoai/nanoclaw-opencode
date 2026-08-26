@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('./model-discovery.js', () => ({
   discoverOpenCodeProviders: vi.fn().mockResolvedValue([
+    { id: 'anthropic', name: 'Anthropic' },
+    { id: 'cerebras', name: 'Cerebras' },
     { id: 'openrouter', name: 'OpenRouter' },
     { id: 'deepseek', name: 'DeepSeek' },
+    { id: 'google', name: 'Google' },
+    { id: 'groq', name: 'Groq' },
   ]),
   discoverOpenCodeModels: vi.fn().mockResolvedValue([
     {
@@ -248,6 +252,12 @@ describe('OpenCode channel-created agent provisioning', () => {
     await provisioner.start(context);
     await provisioner.handleText(context, textEvent('name-catalog', 'Catalog Agent'), 'fixture:owner');
     await provisioner.handleResponse(context, response('opencode_browse_providers'));
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:1')).toBe(true);
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_search_providers')).toBe(true);
+    expect(texts).toHaveLength(1);
+    await provisioner.handleResponse(context, response('opencode_provider_page:1'));
+    expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_provider_page:0')).toBe(true);
+    await provisioner.handleResponse(context, response('opencode_search_providers'));
     expect(texts.at(-1)).toContain('provider name');
     expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
 

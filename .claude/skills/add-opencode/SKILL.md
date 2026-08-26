@@ -115,8 +115,8 @@ not require a memory migration. `/migrate-memory` is only for legacy formats.
 
 When an unknown channel chooses **Connect new agent** and OpenCode is the
 instance default, the shared channel flow delegates to this skill. It asks for
-the name, then offers configured connections, a searchable live OpenCode
-provider catalog, and an inline local/custom endpoint path. It discovers models
+the name, then offers configured connections, a paginated live OpenCode
+provider catalog with optional search, and an inline local/custom endpoint path. It discovers models
 live and presents them as a paginated list; model search is an optional fallback,
 not a required step. It requires explicit confirmation, then stores the chosen
 model and provider settings on that new group before the first container starts. Catalog providers

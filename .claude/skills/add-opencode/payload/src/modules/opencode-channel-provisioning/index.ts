@@ -25,6 +25,8 @@ import './cli-resource.js';
 
 const PROVIDER_PREFIX = 'opencode_provider:';
 const CATALOG_PROVIDER_PREFIX = 'opencode_catalog_provider:';
+const PROVIDER_PAGE_PREFIX = 'opencode_provider_page:';
+const PROVIDER_SEARCH = 'opencode_search_providers';
 const MODEL_PREFIX = 'opencode_model:';
 const MODEL_PAGE_PREFIX = 'opencode_model_page:';
 const MODEL_SEARCH = 'opencode_search_models';
@@ -36,6 +38,7 @@ const CANCEL = 'opencode_cancel_agent';
 const MAX_OPTIONS = 8;
 const MODEL_PAGE_SIZE = 3;
 const CATALOG_SEARCH = '__catalog_search__';
+const CATALOG_BROWSE = '__catalog_browse__';
 const CATALOG_SELECTED_PREFIX = '__catalog__:';
 const MODEL_SEARCH_PROVIDER_PREFIX = '__model_search__:';
 const INLINE_URL = '__inline_local_url__';
@@ -168,7 +171,7 @@ async function offerProviderSearch(context: ChannelAgentProvisioningContext, que
   const needle = query.trim().toLowerCase();
   const matches = catalog
     .filter((provider) => provider.id.toLowerCase().includes(needle) || provider.name.toLowerCase().includes(needle))
-    .slice(0, MAX_OPTIONS);
+    .slice(0, MAX_OPTIONS - 2);
   if (!matches.length) {
     await context.deliverText('No matching OpenCode providers. Reply with another provider name or ID.');
     return;
@@ -179,8 +182,59 @@ async function offerProviderSearch(context: ChannelAgentProvisioningContext, que
       selectedLabel: `✅ ${provider.name}`,
       value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
     })),
+    { label: 'Search again', selectedLabel: '🔎 Search again', value: PROVIDER_SEARCH },
     { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
   ]);
+}
+
+async function offerProviderCatalog(context: ChannelAgentProvisioningContext, page = 0): Promise<void> {
+  let catalog;
+  try {
+    catalog = await discoverOpenCodeProviders();
+  } catch {
+    await context.deliverText('Could not read the OpenCode provider catalog. Check network access and try again.');
+    return;
+  }
+  const pageSize = 4;
+  const lastPage = Math.max(0, Math.ceil(catalog.length / pageSize) - 1);
+  const currentPage = Math.min(Math.max(0, page), lastPage);
+  const visible = catalog.slice(currentPage * pageSize, (currentPage + 1) * pageSize);
+  await updateState(context.row.messaging_group_id, {
+    step: 'awaiting_provider',
+    providerId: CATALOG_BROWSE,
+    modelId: null,
+  });
+  await context.deliverQuestion(
+    '☁️ Choose an OpenCode provider',
+    `Provider page ${currentPage + 1} of ${lastPage + 1}:`,
+    [
+      ...visible.map((provider) => ({
+        label: provider.name,
+        selectedLabel: `✅ ${provider.name}`,
+        value: `${CATALOG_PROVIDER_PREFIX}${encodeURIComponent(provider.id)}`,
+      })),
+      ...(currentPage > 0
+        ? [
+            {
+              label: 'Previous providers',
+              selectedLabel: '⬅️ Previous providers',
+              value: `${PROVIDER_PAGE_PREFIX}${currentPage - 1}`,
+            },
+          ]
+        : []),
+      ...(currentPage < lastPage
+        ? [
+            {
+              label: 'Next providers',
+              selectedLabel: '➡️ Next providers',
+              value: `${PROVIDER_PAGE_PREFIX}${currentPage + 1}`,
+            },
+          ]
+        : []),
+      { label: 'Search providers', selectedLabel: '🔎 Search providers', value: PROVIDER_SEARCH },
+      { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
+    ],
+  );
 }
 
 async function offerModels(
@@ -354,6 +408,17 @@ registerChannelAgentProvisioner({
     }
     if (payload.value === BROWSE_PROVIDERS) {
       if (state.step !== 'awaiting_provider') return true;
+      await offerProviderCatalog(context);
+      return true;
+    }
+    if (payload.value.startsWith(PROVIDER_PAGE_PREFIX)) {
+      if (state.step !== 'awaiting_provider' || state.provider_id !== CATALOG_BROWSE) return true;
+      const page = Number(payload.value.slice(PROVIDER_PAGE_PREFIX.length));
+      await offerProviderCatalog(context, Number.isSafeInteger(page) ? page : 0);
+      return true;
+    }
+    if (payload.value === PROVIDER_SEARCH) {
+      if (state.step !== 'awaiting_provider') return true;
       await updateState(context.row.messaging_group_id, {
         step: 'awaiting_provider',
         providerId: CATALOG_SEARCH,
@@ -381,7 +446,11 @@ registerChannelAgentProvisioner({
       return true;
     }
     if (payload.value.startsWith(CATALOG_PROVIDER_PREFIX)) {
-      if (state.step !== 'awaiting_provider' || state.provider_id !== CATALOG_SEARCH) return true;
+      if (
+        state.step !== 'awaiting_provider' ||
+        (state.provider_id !== CATALOG_SEARCH && state.provider_id !== CATALOG_BROWSE)
+      )
+        return true;
       const providerId = decodeURIComponent(payload.value.slice(CATALOG_PROVIDER_PREFIX.length));
       let catalog;
       try {
