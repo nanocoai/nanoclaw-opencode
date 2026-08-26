@@ -16,6 +16,14 @@ Re-running the install refreshes every skill-owned file and pin.
 ```nc:copy
 payload/src/providers/opencode.ts -> src/providers/opencode.ts
 payload/src/providers/opencode-registration.test.ts -> src/providers/opencode-registration.test.ts
+payload/src/modules/opencode-channel-provisioning/index.ts -> src/modules/opencode-channel-provisioning/index.ts
+payload/src/modules/opencode-channel-provisioning/types.ts -> src/modules/opencode-channel-provisioning/types.ts
+payload/src/modules/opencode-channel-provisioning/db.ts -> src/modules/opencode-channel-provisioning/db.ts
+payload/src/modules/opencode-channel-provisioning/migration.ts -> src/modules/opencode-channel-provisioning/migration.ts
+payload/src/modules/opencode-channel-provisioning/model-discovery.ts -> src/modules/opencode-channel-provisioning/model-discovery.ts
+payload/src/modules/opencode-channel-provisioning/cli-resource.ts -> src/modules/opencode-channel-provisioning/cli-resource.ts
+payload/src/modules/opencode-channel-provisioning/model-discovery.test.ts -> src/modules/opencode-channel-provisioning/model-discovery.test.ts
+payload/src/modules/opencode-channel-provisioning/provisioning.test.ts -> src/modules/opencode-channel-provisioning/provisioning.test.ts
 payload/container/agent-runner/src/providers/mcp-to-opencode.ts -> container/agent-runner/src/providers/mcp-to-opencode.ts
 payload/container/agent-runner/src/providers/mcp-to-opencode.test.ts -> container/agent-runner/src/providers/mcp-to-opencode.test.ts
 payload/container/agent-runner/src/providers/opencode.ts -> container/agent-runner/src/providers/opencode.ts
@@ -39,6 +47,10 @@ payload/opencode-cli-tools.test.ts -> src/opencode-cli-tools.test.ts
 
 ```nc:append to:src/providers/index.ts
 import './opencode.js';
+```
+
+```nc:append to:src/modules/index.ts
+import './opencode-channel-provisioning/index.js';
 ```
 
 ```nc:append to:container/agent-runner/src/providers/index.ts
@@ -70,7 +82,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/providers/opencode-registration.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
+pnpm exec vitest run src/providers/opencode-registration.test.ts src/modules/opencode-channel-provisioning/model-discovery.test.ts src/modules/opencode-channel-provisioning/provisioning.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
 cd container/agent-runner && bun test src/providers/opencode-registration.test.ts src/providers/opencode.config.test.ts src/providers/opencode.empty-resume.test.ts src/providers/opencode.memory.test.ts
 ```
 
@@ -87,6 +99,9 @@ pnpm exec tsx setup/index.ts --step provider-auth opencode
 The setup module offers local/self-hosted OpenAI-compatible endpoints,
 OpenRouter, DeepSeek, and a custom provider. API keys are stored in OneCLI;
 `.env` contains only provider, model, and optional base-URL configuration.
+On the next host start, the OpenCode module mirrors that non-secret backend
+configuration into an `Environment default` model-provider connection. Extra
+connections can be managed with `ncl opencode-model-providers`.
 
 ## Use it
 
@@ -97,6 +112,13 @@ ncl groups restart --id <group-id>
 
 Every provider reads the same group memory tree, so switching providers does
 not require a memory migration. `/migrate-memory` is only for legacy formats.
+
+When an unknown channel chooses **Connect new agent** and OpenCode is the
+instance default, the shared channel flow delegates to this skill. It asks for
+the name and connection, discovers models live, requires explicit confirmation,
+then stores the chosen model and connection settings on that new group before
+the first container starts. The durable wizard row survives host restarts and
+works through every channel adapter using the generic approval flow.
 
 OpenCode runs in `/workspace/agent`, explicitly reads the composed
 `CLAUDE.md`, and keeps its SDK client scoped to that same directory. Session

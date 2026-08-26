@@ -15,13 +15,45 @@
  * barrel is guarded by the sibling bun test; the SDK/CLI dependency + Dockerfile install
  * are guarded by the build/container legs (see the skill's validate step).
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { describe, it, expect } from 'vitest';
 
-import { listProviderContainerConfigNames } from './provider-container-registry.js';
+import { getProviderContainerConfig, listProviderContainerConfigNames } from './provider-container-registry.js';
 import './index.js'; // the real host provider barrel — triggers each provider's self-registration
 
 describe('opencode provider host registration', () => {
   it('registers opencode host container-config via the barrel', () => {
     expect(listProviderContainerConfigNames()).toContain('opencode');
+  });
+
+  it('turns the group-selected model and provider settings into per-container env', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-registration-'));
+    try {
+      const contribution = await getProviderContainerConfig('opencode')!({
+        sessionDir: root,
+        agentGroupId: 'selected-group',
+        groupDir: root,
+        selectedSkills: [],
+        model: 'openai/selected-live-model',
+        providerSettings: {
+          opencode: {
+            modelProvider: 'openai',
+            baseUrl: 'http://host.docker.internal:8891/v1',
+            contextLimit: 65536,
+          },
+        },
+        hostEnv: { OPENCODE_MODEL: 'openai/global-default' },
+      });
+      expect(contribution.env).toMatchObject({
+        OPENCODE_MODEL: 'openai/selected-live-model',
+        OPENCODE_PROVIDER: 'openai',
+        ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
+        OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

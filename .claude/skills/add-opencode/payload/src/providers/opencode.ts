@@ -59,6 +59,22 @@ registerProviderContainerConfig('opencode', (ctx) => {
     if (value) env[key] = value;
   }
 
+  const settings =
+    typeof ctx.providerSettings === 'object' && ctx.providerSettings !== null
+      ? (ctx.providerSettings as Record<string, unknown>).opencode
+      : undefined;
+  const opencode =
+    typeof settings === 'object' && settings !== null ? (settings as Record<string, unknown>) : undefined;
+  if (ctx.model) env.OPENCODE_MODEL = ctx.model;
+  if (typeof opencode?.modelProvider === 'string') env.OPENCODE_PROVIDER = opencode.modelProvider;
+  if (typeof opencode?.baseUrl === 'string' && opencode.baseUrl) env.ANTHROPIC_BASE_URL = opencode.baseUrl;
+  if (typeof opencode?.smallModel === 'string') env.OPENCODE_SMALL_MODEL = opencode.smallModel;
+  if (typeof opencode?.contextLimit === 'number') env.OPENCODE_MODEL_CONTEXT_LIMIT = String(opencode.contextLimit);
+  if (typeof opencode?.outputLimit === 'number') env.OPENCODE_MODEL_OUTPUT_LIMIT = String(opencode.outputLimit);
+  if (typeof opencode?.inputModalities === 'string') {
+    env.OPENCODE_MODEL_INPUT_MODALITIES = opencode.inputModalities;
+  }
+
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],
     env,

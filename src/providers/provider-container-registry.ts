@@ -48,6 +48,10 @@ export interface ProviderContainerContext {
    * providers use this to sync their own skill-discovery links.
    */
   selectedSkills: string[];
+  /** Per-group selected model, when one is configured. */
+  model?: string;
+  /** Provider-owned settings persisted by an optional provider skill. */
+  providerSettings?: unknown;
   /** `process.env` at spawn time — pull passthrough values from here. */
   hostEnv: NodeJS.ProcessEnv;
 }
