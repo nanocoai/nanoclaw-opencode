@@ -1,4 +1,5 @@
 import { getDb } from '../../db/connection.js';
+import { readEnvFile } from '../../env.js';
 import type { OpenCodeModelProvider, OpenCodeProvisioningState, ProvisioningStep } from './types.js';
 
 export async function listProviders(): Promise<OpenCodeModelProvider[]> {
@@ -106,10 +107,16 @@ export async function persistProviderSettings(
   provider: OpenCodeModelProvider,
   model: { id: string; contextLimit: number | null; outputLimit: number | null; inputModalities: string },
 ): Promise<void> {
+  const env = readEnvFile(['OPENCODE_AUTH_MODE']);
+  const authMode =
+    provider.id === 'environment-default'
+      ? (process.env.OPENCODE_AUTH_MODE ?? env.OPENCODE_AUTH_MODE)?.trim() || undefined
+      : undefined;
   await getDb().run(
     'UPDATE container_configs SET provider_settings = ?, updated_at = ? WHERE agent_group_id = ?',
     JSON.stringify({
       opencode: {
+        authMode,
         modelProvider: provider.provider_id,
         baseUrl: provider.base_url,
         smallModel: model.id,

@@ -1,5 +1,6 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import * as p from '@clack/prompts';
@@ -9,11 +10,21 @@ import { brandBody } from '../lib/theme.js';
 import * as setupLog from '../logs.js';
 import { removeEnvVar, upsertEnvVar } from '../set-env.js';
 import { registerSetupProvider } from './registry.js';
+import { CONTAINER_IMAGE } from '../../src/config.js';
+import { CONTAINER_RUNTIME_BIN } from '../../src/container-runtime.js';
 
-type Backend = 'local' | 'openrouter' | 'deepseek' | 'custom' | 'skip';
+type Backend = 'chatgpt' | 'local' | 'openrouter' | 'deepseek' | 'custom' | 'skip';
+type ChatGptLoginMethod = 'browser' | 'device';
 
 const MAX_MODEL_DISCOVERY_BYTES = 1024 * 1024;
 const MANUAL_MODEL = '__manual_model__';
+const OPENCODE_AUTH_MODE = 'OPENCODE_AUTH_MODE';
+const OPENCODE_CHATGPT_STUB = path.join('data', 'opencode', 'openai-auth-stub.json');
+const ONECLI_SENTINEL = 'onecli-managed';
+export const OPENCODE_CHATGPT_MODELS = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.3-codex-spark'] as const;
+// Far enough in the future that OpenCode never tries to exchange the sentinel
+// refresh token. OneCLI owns refresh and replaces the sentinel bearer in flight.
+const STUB_EXPIRES_AT = Date.UTC(2100, 0, 1);
 
 function answer<T>(value: T | symbol): T {
   if (p.isCancel(value)) {
@@ -103,11 +114,119 @@ function saveKey(name: string, key: string, host: string): void {
   );
 }
 
+function runInherit(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: 'inherit', env });
+    child.on('close', (code) => resolve(code ?? 1));
+    child.on('error', () => resolve(1));
+  });
+}
+
+export function buildOpenCodeLoginArgs(loginDir: string, method: ChatGptLoginMethod, interactive: boolean): string[] {
+  const label = method === 'device' ? 'ChatGPT Pro/Plus (headless)' : 'ChatGPT Pro/Plus (browser)';
+  return [
+    'run',
+    '--rm',
+    ...(interactive ? ['-i', '-t'] : ['-i']),
+    '-v',
+    `${loginDir}:/opencode-login`,
+    ...(method === 'browser' ? ['-p', '127.0.0.1:1455:1455'] : []),
+    '-e',
+    'XDG_DATA_HOME=/opencode-login/data',
+    '-e',
+    'XDG_CONFIG_HOME=/opencode-login/config',
+    '-e',
+    'XDG_CACHE_HOME=/opencode-login/cache',
+    '--entrypoint',
+    'opencode',
+    CONTAINER_IMAGE,
+    'auth',
+    'login',
+    '--provider',
+    'openai',
+    '--method',
+    label,
+  ];
+}
+
+/** Replace live OpenCode OAuth tokens with OneCLI sentinels while retaining routing metadata. */
+export function buildOpenCodeOAuthStub(authJson: unknown): Record<string, unknown> {
+  if (!authJson || typeof authJson !== 'object') throw new Error('OpenCode auth.json is not an object');
+  const openai = (authJson as Record<string, unknown>).openai;
+  if (!openai || typeof openai !== 'object') throw new Error('OpenCode auth.json has no OpenAI entry');
+  const record = openai as Record<string, unknown>;
+  if (record.type !== 'oauth' || typeof record.access !== 'string' || typeof record.refresh !== 'string') {
+    throw new Error('OpenCode did not create an OpenAI OAuth credential');
+  }
+  return {
+    openai: {
+      ...record,
+      access: ONECLI_SENTINEL,
+      refresh: ONECLI_SENTINEL,
+      expires: STUB_EXPIRES_AT,
+    },
+  };
+}
+
+export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promise<void> {
+  const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
+  const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
+
+  p.log.step(brandBody(method === 'device' ? 'Starting ChatGPT device pairing…' : 'Opening ChatGPT sign-in…'));
+  const code = await runInherit(
+    CONTAINER_RUNTIME_BIN,
+    buildOpenCodeLoginArgs(loginDir, method, Boolean(process.stdin.isTTY && process.stdout.isTTY)),
+    process.env,
+  );
+  if (code !== 0) {
+    removeLoginDir();
+    throw new Error('OpenCode ChatGPT sign-in did not complete');
+  }
+
+  const authPath = path.join(loginDir, 'data', 'opencode', 'auth.json');
+  if (!fs.existsSync(authPath)) {
+    removeLoginDir();
+    throw new Error('OpenCode sign-in completed without writing auth.json');
+  }
+
+  try {
+    const authJson = JSON.parse(fs.readFileSync(authPath, 'utf8')) as unknown;
+    const stub = buildOpenCodeOAuthStub(authJson);
+    execFileSync(
+      'onecli',
+      [
+        'secrets',
+        'create',
+        '--name',
+        'OpenCode ChatGPT',
+        '--type',
+        'openai',
+        '--file',
+        authPath,
+        '--host-pattern',
+        'chatgpt.com',
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const stubPath = path.join(process.cwd(), OPENCODE_CHATGPT_STUB);
+    fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+    fs.writeFileSync(stubPath, `${JSON.stringify(stub, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(stubPath, 0o600);
+  } finally {
+    removeLoginDir();
+  }
+}
+
 export async function runOpenCodeAuthStep(): Promise<void> {
   const backend = answer(
     await brightSelect<Backend>({
       message: 'Which model backend should OpenCode use?',
       options: [
+        {
+          value: 'chatgpt',
+          label: 'ChatGPT subscription',
+          hint: 'Plus or Pro via browser sign-in or device pairing',
+        },
         {
           value: 'local',
           label: 'Local or self-hosted',
@@ -131,7 +250,35 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   let provider: string = backend;
   let baseUrl = '';
   let host = '';
-  if (backend === 'local') {
+  if (backend === 'chatgpt') {
+    provider = 'openai';
+    host = 'chatgpt.com';
+    const method = answer(
+      await brightSelect<ChatGptLoginMethod>({
+        message: 'How would you like to connect ChatGPT?',
+        options: [
+          { value: 'device', label: 'Device pairing', hint: 'recommended over SSH — shows a URL and code' },
+          { value: 'browser', label: 'Browser sign-in', hint: 'opens a browser on this machine' },
+        ],
+      }),
+    );
+    setupLog.userInput('opencode_chatgpt_auth_method', method);
+    try {
+      await runOpenCodeChatGptAuth(method);
+    } catch (error) {
+      setupLog.step('auth', 'failed', 0, {
+        PROVIDER: 'opencode',
+        BACKEND: backend,
+        ERROR: error instanceof Error ? error.message : String(error),
+      });
+      p.log.error(
+        brandBody(
+          `Could not connect ChatGPT (${error instanceof Error ? error.message : String(error)}). Re-run setup and try again.`,
+        ),
+      );
+      process.exit(1);
+    }
+  } else if (backend === 'local') {
     provider = 'openai';
     baseUrl = answer(
       await p.text({
@@ -168,7 +315,9 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   }
 
   let discoveredModels: string[] = [];
-  if (backend === 'local') {
+  if (backend === 'chatgpt') {
+    discoveredModels = [...OPENCODE_CHATGPT_MODELS];
+  } else if (backend === 'local') {
     try {
       discoveredModels = await discoverLocalModelIds(baseUrl);
     } catch (error) {
@@ -208,16 +357,23 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   upsertEnvVar('OPENCODE_SMALL_MODEL', model);
   if (baseUrl) upsertEnvVar('ANTHROPIC_BASE_URL', baseUrl);
   else removeEnvVar('ANTHROPIC_BASE_URL');
+  if (backend === 'chatgpt') upsertEnvVar(OPENCODE_AUTH_MODE, 'chatgpt');
+  else removeEnvVar(OPENCODE_AUTH_MODE);
 
-  const key = normalizeOptionalInput(
-    answer(
-      await p.password({
-        message: backend === 'local' ? 'API key (leave blank if this endpoint is keyless)' : 'API key',
-        validate: (value) =>
-          (backend !== 'openrouter' && backend !== 'deepseek') || String(value ?? '').trim() ? undefined : 'Required.',
-      }),
-    ),
-  );
+  const key =
+    backend === 'chatgpt'
+      ? ''
+      : normalizeOptionalInput(
+          answer(
+            await p.password({
+              message: backend === 'local' ? 'API key (leave blank if this endpoint is keyless)' : 'API key',
+              validate: (value) =>
+                (backend !== 'openrouter' && backend !== 'deepseek') || String(value ?? '').trim()
+                  ? undefined
+                  : 'Required.',
+            }),
+          ),
+        );
   if (key) {
     if (!host) {
       host = answer(

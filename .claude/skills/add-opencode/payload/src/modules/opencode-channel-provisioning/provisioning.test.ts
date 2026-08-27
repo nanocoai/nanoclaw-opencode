@@ -38,6 +38,7 @@ import {
   type ChannelAgentProvisioningContext,
 } from '../permissions/channel-agent-provisioner.js';
 import type { PendingChannelApproval } from '../permissions/db/pending-channel-approvals.js';
+import { getProvider, persistProviderSettings, syncEnvironmentProvider } from './db.js';
 import { opencodeChannelProvisioningMigration } from './migration.js';
 import './index.js';
 
@@ -68,11 +69,32 @@ describe('OpenCode channel-created agent provisioning', () => {
     );
   });
 
-  afterEach(closeDb);
+  afterEach(() => {
+    delete process.env.OPENCODE_AUTH_MODE;
+    closeDb();
+  });
 
   it('can adopt the tables and provider_settings column left by the first-class implementation', async () => {
     if (opencodeChannelProvisioningMigration.sqliteOnly) throw new Error('expected a portable migration');
     await expect(opencodeChannelProvisioningMigration.up(getDb())).resolves.toBeUndefined();
+  });
+
+  it('snapshots ChatGPT auth only onto the environment-default connection', async () => {
+    process.env.OPENCODE_AUTH_MODE = 'chatgpt';
+    await ensureContainerConfig('anchor');
+    await syncEnvironmentProvider({ providerId: 'openai' });
+    const provider = await getProvider('environment-default');
+    expect(provider).toBeDefined();
+    await persistProviderSettings('anchor', provider!, {
+      id: 'openai/gpt-5.4',
+      contextLimit: 32768,
+      outputLimit: 8192,
+      inputModalities: 'text,image',
+    });
+    const config = await getContainerConfig('anchor');
+    expect(JSON.parse(config!.provider_settings!)).toMatchObject({
+      opencode: { authMode: 'chatgpt', modelProvider: 'openai' },
+    });
   });
 
   it('keeps wizard state in the DB, confirms explicitly, and persists the selected model per group', async () => {

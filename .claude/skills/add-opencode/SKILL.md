@@ -96,9 +96,13 @@ cd container/agent-runner && bun test src/providers/opencode-registration.test.t
 pnpm exec tsx setup/index.ts --step provider-auth opencode
 ```
 
-The setup module offers local/self-hosted OpenAI-compatible endpoints,
-OpenRouter, DeepSeek, and a custom provider. API keys are stored in OneCLI;
-`.env` contains only provider, model, and optional base-URL configuration.
+The setup module offers ChatGPT Plus/Pro through OpenCode's native browser or
+device-pairing flow, local/self-hosted OpenAI-compatible endpoints, OpenRouter,
+DeepSeek, and a custom provider. ChatGPT login runs in the pinned agent image
+with an isolated temporary XDG directory. The live OAuth record is moved into
+OneCLI, the temporary directory is deleted, and the runtime sees only a
+read-only `onecli-managed` stub. API keys are likewise stored in OneCLI;
+`.env` contains only provider, model, auth-mode, and optional base-URL configuration.
 On the next host start, the OpenCode module mirrors that non-secret backend
 configuration into an `Environment default` model-provider connection. Extra
 connections can be managed with `ncl opencode-model-providers`.

@@ -3,7 +3,13 @@ import path from 'path';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { discoverLocalModelIds, normalizeOptionalInput } from './opencode.js';
+import {
+  buildOpenCodeLoginArgs,
+  buildOpenCodeOAuthStub,
+  discoverLocalModelIds,
+  normalizeOptionalInput,
+  OPENCODE_CHATGPT_MODELS,
+} from './opencode.js';
 
 describe('OpenCode setup payload', () => {
   it('accepts a blank optional API key for a keyless local endpoint', () => {
@@ -29,6 +35,61 @@ describe('OpenCode setup payload', () => {
   it('rejects malformed model discovery responses so the wizard can fall back to manual input', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ models: [] })));
     await expect(discoverLocalModelIds('http://127.0.0.1:8891/v1', fetchImpl)).rejects.toThrow('no data array');
+  });
+
+  it('replaces live OAuth tokens with a non-expiring OneCLI stub and keeps account routing metadata', () => {
+    expect(
+      buildOpenCodeOAuthStub({
+        openai: {
+          type: 'oauth',
+          access: 'live-access-token',
+          refresh: 'live-refresh-token',
+          expires: 1,
+          accountId: 'account-123',
+        },
+      }),
+    ).toEqual({
+      openai: {
+        type: 'oauth',
+        access: 'onecli-managed',
+        refresh: 'onecli-managed',
+        expires: Date.UTC(2100, 0, 1),
+        accountId: 'account-123',
+      },
+    });
+  });
+
+  it('rejects API-key auth records instead of misrepresenting them as subscription OAuth', () => {
+    expect(() => buildOpenCodeOAuthStub({ openai: { type: 'api', key: 'sk-live' } })).toThrow(
+      'did not create an OpenAI OAuth credential',
+    );
+  });
+
+  it('runs the pinned container CLI with isolated XDG state for device pairing', () => {
+    const args = buildOpenCodeLoginArgs('/tmp/login', 'device', false);
+    expect(args).toContain('/tmp/login:/opencode-login');
+    expect(args).toContain('XDG_DATA_HOME=/opencode-login/data');
+    expect(args.slice(-6)).toEqual([
+      'auth',
+      'login',
+      '--provider',
+      'openai',
+      '--method',
+      'ChatGPT Pro/Plus (headless)',
+    ]);
+    expect(args).not.toContain('-t');
+    expect(args).not.toContain('127.0.0.1:1455:1455');
+  });
+
+  it('publishes only the native callback port for browser sign-in', () => {
+    const args = buildOpenCodeLoginArgs('/tmp/login', 'browser', true);
+    expect(args).toContain('127.0.0.1:1455:1455');
+    expect(args).toContain('-t');
+    expect(args.at(-1)).toBe('ChatGPT Pro/Plus (browser)');
+  });
+
+  it('offers the exact ChatGPT subscription models allowed by the pinned OpenCode plugin', () => {
+    expect(OPENCODE_CHATGPT_MODELS).toEqual(['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.3-codex-spark']);
   });
 
   it('keeps the verified runtime pin and trusted postinstall together', () => {
