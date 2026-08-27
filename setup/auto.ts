@@ -448,13 +448,12 @@ async function main(): Promise<void> {
     }
 
     let providerEntry = getSetupProvider(agentProvider);
-    if (agentProvider !== 'claude' && !providerEntry) {
-      // A non-claude provider picked from the hard-wired list isn't wired in
-      // this install yet — install it by applying its `/add-<name>` SKILL.md
-      // in-process via the directive engine (channel style, refresh-safe),
-      // rebuild the image (the container step
-      // already ran, the CLI manifest just changed), then load the payload's
-      // setup module so it self-registers.
+    if (agentProvider !== 'claude') {
+      // Always install OR refresh the selected provider before auth. A prior
+      // interrupted apply can already have appended the setup registration
+      // while failing later at dependency installation; registration alone is
+      // therefore not proof that the provider is complete. Reapplying the
+      // canonical skill is idempotent and is also the provider upgrade path.
       const skillDir = `.claude/skills/add-${agentProvider}`;
       const s = p.spinner();
       s.start(`Installing ${agentProvider}…`);
@@ -484,8 +483,10 @@ async function main(): Promise<void> {
           rebuild.hint,
         );
       }
-      await import(`./providers/${agentProvider}.js`);
-      providerEntry = getSetupProvider(agentProvider);
+      if (!providerEntry) {
+        await import(`./providers/${agentProvider}.js`);
+        providerEntry = getSetupProvider(agentProvider);
+      }
     }
     if (providerEntry?.runAuth) {
       await providerEntry.runAuth();

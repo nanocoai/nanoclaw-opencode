@@ -31,6 +31,7 @@
 import { execSync } from 'node:child_process';
 
 import { applySkill, type ApplyResult } from '../../scripts/skill-apply.js';
+import { commandAvailable, portableDependencyCommand } from '../../scripts/portable-dependency-command.js';
 
 /** Commands the directive engine emits that the surrounding setup flow owns. */
 function isFlowOwnedCommand(cmd: string): boolean {
@@ -54,7 +55,19 @@ export interface ProviderInstallResult {
   blockers: string[];
 }
 
-export async function applyProviderSkill(skillDir: string, projectRoot: string): Promise<ProviderInstallResult> {
+interface ProviderInstallOptions {
+  commandAvailable?: (command: string, cwd: string) => boolean;
+  exec?: (command: string, cwd: string) => string | void;
+}
+
+export async function applyProviderSkill(
+  skillDir: string,
+  projectRoot: string,
+  options: ProviderInstallOptions = {},
+): Promise<ProviderInstallResult> {
+  const hasCommand = options.commandAvailable ?? commandAvailable;
+  const bunOnHost = hasCommand('bun', projectRoot);
+  const run = options.exec ?? ((command: string, cwd: string) => execSync(command, { cwd, stdio: 'pipe' }));
   // A provider SKILL.md has no prompt directives (vault-only auth runs
   // separately). No resolveInput is passed: absent ⇒ any prompt defers, which
   // is exactly the old defer-all stub's semantics with no stub to maintain.
@@ -65,8 +78,9 @@ export async function applyProviderSkill(skillDir: string, projectRoot: string):
     mode: 'refresh',
     exec: (cmd) => {
       if (isFlowOwnedCommand(cmd)) return; // build/test/auth are the flow's job
-      execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
+      return run(cmd, projectRoot);
     },
+    resolveDependencyCommand: (request) => portableDependencyCommand(projectRoot, bunOnHost, request),
     // Fork-aware: reuse the existing resolver (handles upstream/fork remotes and
     // the auto-add-upstream fallback) instead of assuming `origin` — same call
     // setup/channels/slack.ts makes for the `channels` branch.

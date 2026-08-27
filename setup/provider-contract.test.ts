@@ -95,6 +95,8 @@ describe('codex installs from its hard-wired /add-codex skill in-process', () =>
     const src = read('setup/auto.ts');
     expect(src).toContain('applyProviderSkill');
     expect(src).toContain('.claude/skills/add-${agentProvider}');
+    expect(src).toContain("if (agentProvider !== 'claude')");
+    expect(src).not.toContain("agentProvider !== 'claude' && !providerEntry");
     // No shell-out to a per-provider install script.
     expect(src).not.toContain('setup/add-${agentProvider}.sh');
     // The removed branch-enumeration machinery must not creep back in.
