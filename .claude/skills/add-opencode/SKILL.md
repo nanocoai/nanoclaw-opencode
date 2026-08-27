@@ -149,4 +149,21 @@ text and are never fetched implicitly.
 - Custom endpoint fails after the first turn: include `/v1` and use provider `openai`.
 - Version mismatch: reapply the skill so CLI and SDK both return to 1.18.21.
 
+## Provider-contract compatibility
+
+NanoClaw PRs
+[#3581](https://github.com/nanocoai/nanoclaw/pull/3581) and
+[#3584](https://github.com/nanocoai/nanoclaw/pull/3584) introduce declarative
+host, setup, and runtime provider contracts. Their direction matches this
+skill-first provider, but the OpenCode implementation in #3584 predates this
+payload's setup authentication and per-group ChatGPT mode.
+
+When adopting those contracts, declare OpenCode setup authentication and its
+install check as provider-owned instead of waived. Preserve the channel
+provisioning module, restart-safe wizard state, live model discovery, and
+per-group provider/model settings; those are additional behavior rather than
+replacements for the contract. The conditional read-only OneCLI credential
+stub currently remains in the legacy host adapter until the declarative host
+contract can represent a group-selected, gateway-owned credential file.
+
 To uninstall the provider, follow [REMOVE.md](REMOVE.md).
