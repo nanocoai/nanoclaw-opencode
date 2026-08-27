@@ -1,6 +1,6 @@
 # Setup Wiring — Status & Remaining Work
 
-Last updated: 2026-07-10
+Last updated: 2026-08-28
 
 ## What's Done
 
@@ -31,6 +31,21 @@ Last updated: 2026-07-10
 - Accepts `--platform-id` flag
 - `getMessagingGroupAgentByPair()` prevents duplicate wiring
 - `setup/verify.ts` checks the central DB (counts agent groups with wiring)
+
+### Known limitation: the welcome banner does not prove provider health
+
+After a DM channel is wired, setup currently prints “your assistant is saying
+hi.” This confirms that `init-first-agent` handed the `/welcome` request to the
+running service; it does not confirm that the selected provider authenticated
+or produced a successful model response. The channel may therefore receive a
+provider error—such as a missing OneCLI credential—after setup has already
+printed “You're set.”
+
+Until setup observes a successful outbound assistant response, its completion
+copy should describe a welcome request as sent or queued rather than claiming
+that the assistant replied. A complete fix should distinguish channel-wiring
+success from provider-round-trip success and surface authentication failures
+before presenting the final ready state.
 
 ### Router Logging
 - `src/router.ts` logs `MESSAGE DROPPED` at WARN level when no agents wired, with actionable guidance
