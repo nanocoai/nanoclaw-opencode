@@ -59,7 +59,7 @@ import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pend
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
-import { ensureUserDm } from './user-dm.js';
+import { ensureUserDm, isCachedUserDmEvent } from './user-dm.js';
 import {
   getChannelAgentProvisioner,
   getChannelAgentProvisioners,
@@ -447,6 +447,7 @@ export async function wireApprovedChannel(
 function provisioningContext(row: PendingChannelApproval): ChannelAgentProvisioningContext {
   return {
     row,
+    isApproverDm: (event) => isCachedUserDmEvent(row.approver_user_id, event),
     async deliverQuestion(title, question, rawOptions) {
       const approverDm = await ensureUserDm(row.approver_user_id);
       const adapter = getDeliveryAdapter();
@@ -460,6 +461,8 @@ function provisioningContext(row: PendingChannelApproval): ChannelAgentProvision
           null,
           'chat-sdk',
           JSON.stringify({ type: 'ask_question', questionId: row.messaging_group_id, title, question, options }),
+          undefined,
+          approverDm.instance,
         );
         return true;
       } catch (err) {
@@ -481,6 +484,8 @@ function provisioningContext(row: PendingChannelApproval): ChannelAgentProvision
           null,
           'chat-sdk',
           JSON.stringify({ text }),
+          undefined,
+          approverDm.instance,
         );
       } catch (err) {
         log.error('Channel registration: provisioner status delivery failed', {

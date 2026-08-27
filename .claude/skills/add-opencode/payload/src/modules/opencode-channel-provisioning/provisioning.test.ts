@@ -84,6 +84,10 @@ describe('OpenCode channel-created agent provisioning', () => {
     let createdBeforeConfirmation = false;
     const context: ChannelAgentProvisioningContext = {
       row,
+      isApproverDm: async (event) =>
+        event.channelType === 'fixture' &&
+        (event.instance ?? event.channelType) === 'fixture' &&
+        event.platformId === 'owner-dm',
       deliverQuestion: async (title, _question, options) => {
         cards.push({ title, options: options as Array<{ label?: string; value?: string }> });
         return true;
@@ -109,6 +113,47 @@ describe('OpenCode channel-created agent provisioning', () => {
 
     await provisioner.start(context);
     expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
+    await expect(
+      provisioner.handleText(
+        context,
+        {
+          channelType: 'fixture',
+          platformId: 'different-surface',
+          threadId: null,
+          message: {
+            id: 'wrong-surface-name',
+            kind: 'chat-sdk',
+            content: JSON.stringify({ text: 'Must Not Be Consumed' }),
+            timestamp: now(),
+          },
+        },
+        'fixture:owner',
+      ),
+    ).resolves.toBe(false);
+    expect(
+      await getDb().get<{ step: string; agent_name: string | null }>(
+        'SELECT step, agent_name FROM opencode_channel_provisioning WHERE messaging_group_id = ?',
+        'origin',
+      ),
+    ).toEqual({ step: 'awaiting_name', agent_name: null });
+    await expect(
+      provisioner.handleText(
+        context,
+        {
+          channelType: 'fixture',
+          instance: 'fixture-secondary',
+          platformId: 'owner-dm',
+          threadId: null,
+          message: {
+            id: 'wrong-instance-name',
+            kind: 'chat-sdk',
+            content: JSON.stringify({ text: 'Must Not Be Consumed Either' }),
+            timestamp: now(),
+          },
+        },
+        'fixture:owner',
+      ),
+    ).resolves.toBe(false);
     await provisioner.handleText(
       context,
       {
@@ -126,7 +171,13 @@ describe('OpenCode channel-created agent provisioning', () => {
     );
     expect(cards.at(-1)?.title).toContain('provider');
     expect(cards.at(-1)?.options?.map((option) => option.label)).toEqual(
-      expect.arrayContaining(['Local MLX', 'OpenCode Zen', 'OpenRouter', 'More providers…', 'Local or custom endpoint']),
+      expect.arrayContaining([
+        'Local MLX',
+        'OpenCode Zen',
+        'OpenRouter',
+        'More providers…',
+        'Local or custom endpoint',
+      ]),
     );
     expect(cards.at(-1)?.options).toHaveLength(8);
 
@@ -216,6 +267,10 @@ describe('OpenCode channel-created agent provisioning', () => {
     const texts: string[] = [];
     const context: ChannelAgentProvisioningContext = {
       row,
+      isApproverDm: async (event) =>
+        event.channelType === 'fixture' &&
+        (event.instance ?? event.channelType) === 'fixture' &&
+        event.platformId === 'owner-dm',
       deliverQuestion: async (title, _question, options) => {
         cards.push({ title, options: options as Array<{ value?: string }> });
         return true;
@@ -298,6 +353,10 @@ describe('OpenCode channel-created agent provisioning', () => {
     const texts: string[] = [];
     const context: ChannelAgentProvisioningContext = {
       row,
+      isApproverDm: async (event) =>
+        event.channelType === 'fixture' &&
+        (event.instance ?? event.channelType) === 'fixture' &&
+        event.platformId === 'owner-dm',
       deliverQuestion: async () => true,
       deliverText: async (text) => void texts.push(text),
       createAgent: async ({ name, provider, model }) => {

@@ -16,8 +16,8 @@ import { canAccessAgentGroup } from './access.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
 import { grantRole, hasAnyOwner, isOwner } from './db/user-roles.js';
-import { getUserDm } from './db/user-dms.js';
-import { ensureUserDm } from './user-dm.js';
+import { getUserDm, upsertUserDm } from './db/user-dms.js';
+import { ensureUserDm, isCachedUserDmEvent } from './user-dm.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -165,6 +165,43 @@ describe('role helpers', () => {
 });
 
 describe('ensureUserDm', () => {
+  it('matches only the exact cached DM instance without resolving on a cache miss', async () => {
+    const mock = await mountMockAdapter('slack', async (handle) => `dm-${handle}`);
+    await seedUser('slack:u1', 'slack');
+
+    const event = {
+      channelType: 'slack',
+      instance: 'slack-work',
+      platformId: 'dm-u1',
+      threadId: null,
+      message: { id: 'm1', kind: 'chat-sdk' as const, content: '{}', timestamp: now() },
+    };
+    expect(await isCachedUserDmEvent('slack:u1', event)).toBe(false);
+    expect(mock.openDMCalls).toEqual([]);
+
+    await createMessagingGroup({
+      id: 'mg-named-dm',
+      channel_type: 'slack',
+      instance: 'slack-work',
+      platform_id: 'dm-u1',
+      name: 'Named DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await upsertUserDm({
+      user_id: 'slack:u1',
+      channel_type: 'slack',
+      messaging_group_id: 'mg-named-dm',
+      resolved_at: now(),
+    });
+
+    expect(await isCachedUserDmEvent('slack:u1', event)).toBe(true);
+    expect(await isCachedUserDmEvent('slack:u1', { ...event, instance: 'slack-other' })).toBe(false);
+    expect(await isCachedUserDmEvent('slack:u1', { ...event, platformId: 'other-dm' })).toBe(false);
+    expect(mock.openDMCalls).toEqual([]);
+  });
+
   it('adapter without openDM: falls through to using the bare handle as platform_id', async () => {
     await mountMockAdapter('nodm');
     await seedUser('nodm:123', 'nodm');

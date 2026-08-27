@@ -346,6 +346,7 @@ registerChannelAgentProvisioner({
   pendingTextInputFor,
   async handleText(context, event, approverUserId) {
     if (approverUserId !== context.row.approver_user_id) return false;
+    if (!(await context.isApproverDm(event))) return false;
     const state = await getState(context.row.messaging_group_id);
     if (!state) return false;
     const text = messageText(event);

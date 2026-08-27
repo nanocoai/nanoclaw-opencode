@@ -13,6 +13,7 @@ export interface ProvisionedAgentInput {
 
 export interface ChannelAgentProvisioningContext {
   row: PendingChannelApproval;
+  isApproverDm(event: InboundEvent): Promise<boolean>;
   deliverQuestion(title: string, question: string, options: RawOption[]): Promise<boolean>;
   deliverText(text: string): Promise<void>;
   createAgent(input: ProvisionedAgentInput): Promise<AgentGroup>;
