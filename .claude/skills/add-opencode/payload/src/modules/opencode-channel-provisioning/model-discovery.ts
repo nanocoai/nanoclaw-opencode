@@ -1,5 +1,10 @@
 import { execFile } from 'child_process';
-import type { DiscoveredOpenCodeModel, DiscoveredOpenCodeProvider, OpenCodeModelProvider } from './types.js';
+import type {
+  DiscoveredOpenCodeModel,
+  DiscoveredOpenCodeProvider,
+  OpenCodeConnectionV1,
+  OpenCodeModelProvider,
+} from './types.js';
 
 const MODELS_DEV_URL = 'https://models.dev/api.json';
 const MAX_DISCOVERY_BYTES = 8 * 1024 * 1024;
@@ -158,15 +163,18 @@ export async function discoverOpenCodeModels(
   provider: OpenCodeModelProvider,
   fetchImpl?: FetchLike,
   oneCliFetchImpl: JsonFetchLike = fetchJsonViaOneCli,
+  connection?: OpenCodeConnectionV1,
 ): Promise<DiscoveredOpenCodeModel[]> {
   const result =
     provider.discovery_type === 'models-dev'
       ? modelsDev(provider, await fetchJson(MODELS_DEV_URL, false, fetchImpl ?? globalThis.fetch))
       : openAi(
           provider,
-          fetchImpl
-            ? await fetchJson(modelListUrl(provider), true, fetchImpl)
-            : await oneCliFetchImpl(modelListUrl(provider)),
+          connection?.auth.kind === 'keyless'
+            ? await fetchJson(modelListUrl(provider), false, fetchImpl ?? globalThis.fetch)
+            : fetchImpl
+              ? await fetchJson(modelListUrl(provider), true, fetchImpl)
+              : await oneCliFetchImpl(modelListUrl(provider)),
         );
   if (!result.length) throw new Error(`No text models were discovered for ${provider.name}`);
   return result;

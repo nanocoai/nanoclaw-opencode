@@ -11,6 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
@@ -25,6 +26,7 @@ const PASSTHROUGH_KEYS = [
   'OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT',
   'OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES',
 ] as const;
+const AUTH_MODE_KEY = 'OPENCODE_AUTH_MODE';
 
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
@@ -42,12 +44,58 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
 }
 
 interface OpenCodeProviderSettings {
+  authMode?: unknown;
+  route?: unknown;
   modelProvider?: unknown;
   baseUrl?: unknown;
   smallModel?: unknown;
   contextLimit?: unknown;
   outputLimit?: unknown;
   inputModalities?: unknown;
+}
+
+interface CompleteOpenCodeRoute {
+  schemaVersion: 1;
+  providerId: string;
+  modelId: string;
+  modelRef: string;
+  transport:
+    | { kind: 'openai_compatible'; apiMode: 'chat_completions' | 'responses'; baseUrl: string }
+    | { kind: 'opencode_native'; providerId: string; baseUrl?: string };
+  limits?: { context?: number; output?: number };
+  inputModalities?: string[];
+}
+
+function completeRoute(value: unknown): CompleteOpenCodeRoute | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const route = value as Partial<CompleteOpenCodeRoute>;
+  if (
+    route.schemaVersion !== 1 ||
+    typeof route.providerId !== 'string' ||
+    typeof route.modelId !== 'string' ||
+    typeof route.modelRef !== 'string' ||
+    !route.transport ||
+    typeof route.transport !== 'object' ||
+    route.modelRef !== `${route.providerId}/${route.modelId}`
+  ) {
+    throw new Error('OpenCode group route is incomplete or incoherent');
+  }
+  return route as CompleteOpenCodeRoute;
+}
+
+/** A complete route is authoritative: no unrelated service default survives. */
+export function applyCompleteOpenCodeRoute(env: Record<string, string>, value: unknown): boolean {
+  const route = completeRoute(value);
+  if (!route) return false;
+  for (const key of PASSTHROUGH_KEYS) delete env[key];
+  env.OPENCODE_PROVIDER = route.providerId;
+  env.OPENCODE_MODEL = route.modelRef;
+  env.OPENCODE_SMALL_MODEL = route.modelRef;
+  if (route.transport.baseUrl) env.ANTHROPIC_BASE_URL = route.transport.baseUrl;
+  if (route.limits?.context) env.OPENCODE_MODEL_CONTEXT_LIMIT = String(route.limits.context);
+  if (route.limits?.output) env.OPENCODE_MODEL_OUTPUT_LIMIT = String(route.limits.output);
+  if (route.inputModalities?.length) env.OPENCODE_MODEL_INPUT_MODALITIES = route.inputModalities.join(',');
+  return true;
 }
 
 /** Apply group-owned settings over service defaults; invalid values fail closed to unset. */
@@ -98,11 +146,33 @@ registerProviderContainerConfig('opencode', (ctx) => {
       : undefined;
   const opencode =
     typeof settings === 'object' && settings !== null ? (settings as Record<string, unknown>) : undefined;
-  if (ctx.model) env.OPENCODE_MODEL = ctx.model;
-  if (opencode) applyOpenCodeProviderSettings(env, opencode);
+  const hasCompleteRoute = opencode ? applyCompleteOpenCodeRoute(env, opencode.route) : false;
+  if (!hasCompleteRoute) {
+    if (ctx.model) env.OPENCODE_MODEL = ctx.model;
+    if (opencode) applyOpenCodeProviderSettings(env, opencode);
+  }
+
+  const mounts = [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }];
+  const routeAuth =
+    opencode?.route && typeof opencode.route === 'object'
+      ? (opencode.route as { auth?: { kind?: unknown } }).auth
+      : undefined;
+  let authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? readEnvFile([AUTH_MODE_KEY])[AUTH_MODE_KEY];
+  if (hasCompleteRoute) authMode = routeAuth?.kind === 'chatgpt_oauth' ? 'chatgpt' : undefined;
+  else if (opencode) authMode = opencode.authMode === 'chatgpt' ? 'chatgpt' : undefined;
+  if (authMode === 'chatgpt') {
+    const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
+    if (!fs.existsSync(stubPath)) {
+      throw new Error('OpenCode ChatGPT auth is selected, but its OneCLI credential stub is missing; re-run setup');
+    }
+    const authTarget = path.join(opencodeDir, 'opencode', 'auth.json');
+    fs.mkdirSync(path.dirname(authTarget), { recursive: true });
+    fs.closeSync(fs.openSync(authTarget, 'a'));
+    mounts.push({ hostPath: stubPath, containerPath: '/opencode-xdg/opencode/auth.json', readonly: true });
+  }
 
   return {
-    mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],
+    mounts,
     env,
   };
 });

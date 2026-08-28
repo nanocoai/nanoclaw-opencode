@@ -21,6 +21,8 @@ payload/src/modules/opencode-channel-provisioning/types.ts -> src/modules/openco
 payload/src/modules/opencode-channel-provisioning/db.ts -> src/modules/opencode-channel-provisioning/db.ts
 payload/src/modules/opencode-channel-provisioning/migration.ts -> src/modules/opencode-channel-provisioning/migration.ts
 payload/src/modules/opencode-channel-provisioning/model-discovery.ts -> src/modules/opencode-channel-provisioning/model-discovery.ts
+payload/src/modules/opencode-channel-provisioning/readiness-probe.ts -> src/modules/opencode-channel-provisioning/readiness-probe.ts
+payload/src/modules/opencode-channel-provisioning/readiness-probe.test.ts -> src/modules/opencode-channel-provisioning/readiness-probe.test.ts
 payload/src/modules/opencode-channel-provisioning/cli-resource.ts -> src/modules/opencode-channel-provisioning/cli-resource.ts
 payload/src/modules/opencode-channel-provisioning/model-discovery.test.ts -> src/modules/opencode-channel-provisioning/model-discovery.test.ts
 payload/src/modules/opencode-channel-provisioning/provisioning.test.ts -> src/modules/opencode-channel-provisioning/provisioning.test.ts
@@ -82,7 +84,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/providers/opencode-registration.test.ts src/modules/opencode-channel-provisioning/model-discovery.test.ts src/modules/opencode-channel-provisioning/provisioning.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
+pnpm exec vitest run src/providers/opencode-registration.test.ts src/modules/opencode-channel-provisioning/model-discovery.test.ts src/modules/opencode-channel-provisioning/readiness-probe.test.ts src/modules/opencode-channel-provisioning/provisioning.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
 cd container/agent-runner && bun test src/providers/opencode-registration.test.ts src/providers/opencode.config.test.ts src/providers/opencode.empty-resume.test.ts src/providers/opencode.memory.test.ts
 ```
 
@@ -96,9 +98,13 @@ cd container/agent-runner && bun test src/providers/opencode-registration.test.t
 pnpm exec tsx setup/index.ts --step provider-auth opencode
 ```
 
-The setup module offers local/self-hosted OpenAI-compatible endpoints,
-OpenRouter, DeepSeek, and a custom provider. API keys are stored in OneCLI;
-`.env` contains only provider, model, and optional base-URL configuration.
+The setup module offers ChatGPT Plus/Pro through OpenCode's native browser or
+device-pairing flow, local/self-hosted OpenAI-compatible endpoints, OpenRouter,
+DeepSeek, and a custom provider. ChatGPT login runs in the pinned agent image
+with an isolated temporary XDG directory. The live OAuth record is moved into
+OneCLI, the temporary directory is deleted, and runtime receives only a
+read-only `onecli-managed` stub. API keys are stored in OneCLI; `.env` contains
+only provider, model, typed auth mode, and optional base-URL configuration.
 On the next host start, the OpenCode module mirrors that non-secret backend
 configuration into an `Environment default` model-provider connection. Extra
 connections can be managed with `ncl opencode-model-providers`.

@@ -100,4 +100,73 @@ describe('opencode provider host registration', () => {
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('lets a complete route shadow every conflicting service default', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-route-registration-'));
+    try {
+      const contribution = await getProviderContainerConfig('opencode')!({
+        sessionDir: root,
+        agentGroupId: 'route-group',
+        groupDir: root,
+        selectedSkills: [],
+        model: 'openai/wrong-group-model',
+        providerSettings: {
+          opencode: {
+            route: {
+              schemaVersion: 1,
+              connectionId: 'local',
+              providerId: 'openai',
+              modelId: 'selected-live-model',
+              modelRef: 'openai/selected-live-model',
+              auth: { kind: 'keyless' },
+              transport: {
+                kind: 'openai_compatible',
+                apiMode: 'chat_completions',
+                baseUrl: 'http://host.docker.internal:8891/v1',
+              },
+              readiness: { state: 'ready', probedAt: new Date().toISOString(), probeRevision: 'fixture' },
+            },
+          },
+        },
+        hostEnv: {
+          OPENCODE_PROVIDER: 'openrouter',
+          OPENCODE_MODEL: 'openrouter/global-default',
+          ANTHROPIC_BASE_URL: 'https://wrong.example/v1',
+        },
+      });
+      expect(contribution.env).toMatchObject({
+        OPENCODE_PROVIDER: 'openai',
+        OPENCODE_MODEL: 'openai/selected-live-model',
+        ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an incoherent complete route before spawn', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-bad-route-'));
+    const contribute = getProviderContainerConfig('opencode')!;
+    expect(() => {
+      contribute({
+        sessionDir: root,
+        agentGroupId: 'bad-route-group',
+        groupDir: root,
+        selectedSkills: [],
+        providerSettings: {
+          opencode: {
+            route: {
+              schemaVersion: 1,
+              providerId: 'openai',
+              modelId: 'model-a',
+              modelRef: 'openrouter/model-b',
+              transport: { kind: 'opencode_native', providerId: 'openai' },
+            },
+          },
+        },
+        hostEnv: {},
+      });
+    }).toThrow('incomplete or incoherent');
+    fs.rmSync(root, { recursive: true, force: true });
+  });
 });

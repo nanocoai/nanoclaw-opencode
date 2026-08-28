@@ -11,22 +11,29 @@ vi.mock('./model-discovery.js', () => ({
     { id: 'groq', name: 'Groq' },
     { id: 'ollama', name: 'Ollama' },
   ]),
-  discoverOpenCodeModels: vi.fn().mockResolvedValue([
+  discoverOpenCodeModels: vi.fn().mockImplementation(async (provider: { provider_id: string }) => [
     {
-      id: 'openai/selected-live-model',
+      id: `${provider.provider_id}/selected-live-model`,
       name: 'Selected Live Model',
       contextLimit: 65536,
       outputLimit: 8192,
       inputModalities: 'text,image',
     },
     ...Array.from({ length: 5 }, (_, index) => ({
-      id: `openai/browsable-model-${index + 2}`,
+      id: `${provider.provider_id}/browsable-model-${index + 2}`,
       name: `Browsable Model ${index + 2}`,
       contextLimit: 32768,
       outputLimit: 4096,
       inputModalities: 'text',
     })),
   ]),
+}));
+
+vi.mock('./readiness-probe.js', () => ({
+  probeOpenCodeRoute: vi.fn().mockResolvedValue({
+    probedAt: '2026-08-28T00:00:00.000Z',
+    probeRevision: 'test-probe-revision',
+  }),
 }));
 
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
@@ -254,8 +261,28 @@ describe('OpenCode channel-created agent provisioning', () => {
     const config = await getContainerConfig('created');
     expect(config).toMatchObject({ provider: 'opencode', model: 'openai/selected-live-model' });
     expect(JSON.parse(config!.provider_settings!)).toMatchObject({
-      opencode: { modelProvider: 'openai', baseUrl: 'http://host.docker.internal:8891/v1', contextLimit: 65536 },
+      opencode: {
+        modelProvider: 'openai',
+        baseUrl: 'http://host.docker.internal:8891/v1',
+        contextLimit: 65536,
+        route: {
+          schemaVersion: 1,
+          connectionId: 'local',
+          providerId: 'openai',
+          modelId: 'selected-live-model',
+          modelRef: 'openai/selected-live-model',
+          auth: { kind: 'keyless' },
+          readiness: {
+            state: 'ready',
+            probedAt: '2026-08-28T00:00:00.000Z',
+            probeRevision: 'test-probe-revision',
+          },
+        },
+      },
     });
+    await expect(
+      getDb().get('SELECT connection_id, route_json FROM opencode_group_routes WHERE agent_group_id = ?', 'created'),
+    ).resolves.toMatchObject({ connection_id: 'local' });
   });
 
   it('searches the live provider catalog and persists a provider that was not preconfigured', async () => {
@@ -335,11 +362,17 @@ describe('OpenCode channel-created agent provisioning', () => {
     await provisioner.handleText(context, textEvent('provider-search', 'router'), 'fixture:owner');
     expect(cards.at(-1)?.options.some((option) => option.value === 'opencode_catalog_provider:openrouter')).toBe(true);
     await provisioner.handleResponse(context, response('opencode_catalog_provider:openrouter'));
-    await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
+    await provisioner.handleResponse(context, response('opencode_model:openrouter%2Fselected-live-model'));
+    await expect(
+      getDb().get(
+        'SELECT provider_id, model_id FROM opencode_channel_provisioning WHERE messaging_group_id = ?',
+        'origin',
+      ),
+    ).resolves.toMatchObject({ provider_id: '__catalog__:openrouter', model_id: 'openrouter/selected-live-model' });
     await provisioner.handleResponse(context, response('opencode_confirm_agent'));
 
     const config = await getContainerConfig('catalog-created');
-    expect(config).toMatchObject({ provider: 'opencode', model: 'openai/selected-live-model' });
+    expect(config).toMatchObject({ provider: 'opencode', model: 'openrouter/selected-live-model' });
     expect(JSON.parse(config!.provider_settings!)).toMatchObject({
       opencode: { modelProvider: 'openrouter', baseUrl: null },
     });

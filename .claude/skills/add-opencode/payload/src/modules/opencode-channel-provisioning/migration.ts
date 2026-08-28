@@ -46,3 +46,56 @@ export const opencodeChannelProvisioningMigration: ModuleMigration = {
     }
   },
 };
+
+export const opencodeChannelProvisioningResumeMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:opencode:channel-provisioning-resume-v1',
+  async up(db) {
+    const owners = await db.columnOwners?.('agent_group_id');
+    if (!owners?.includes('opencode_channel_provisioning')) {
+      await db.exec(
+        `ALTER TABLE opencode_channel_provisioning
+         ADD COLUMN agent_group_id TEXT REFERENCES agent_groups(id) ON DELETE SET NULL;`,
+      );
+    }
+  },
+};
+
+/**
+ * Existing installs may already have recorded channel-provisioning-v1 from
+ * the pre-route payload. Keep that identity immutable and add typed routes in
+ * a distinct migration so upgrades receive the new tables.
+ */
+export const opencodeTypedRoutesMigration: ModuleMigration = {
+  version: 3,
+  name: 'module:opencode:typed-routes-v1',
+  async up(db) {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS opencode_connections (
+        id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        display_name TEXT NOT NULL,
+        provider_id TEXT NOT NULL,
+        auth_json TEXT NOT NULL,
+        transport_json TEXT NOT NULL,
+        discovery_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_opencode_connections_enabled
+        ON opencode_connections(enabled, display_name, id);
+
+      CREATE TABLE IF NOT EXISTS opencode_group_routes (
+        agent_group_id TEXT PRIMARY KEY REFERENCES agent_groups(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+        connection_id TEXT NOT NULL REFERENCES opencode_connections(id),
+        route_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_opencode_group_routes_connection
+        ON opencode_group_routes(connection_id, agent_group_id);
+    `);
+  },
+};

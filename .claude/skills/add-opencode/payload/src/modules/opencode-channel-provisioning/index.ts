@@ -10,16 +10,23 @@ import {
 import {
   beginState,
   deleteState,
+  ensureConnection,
   getProvider,
   getState,
   listProviders,
+  markRouteReady,
   pendingTextInputFor,
   persistProviderSettings,
   syncEnvironmentProvider,
   updateState,
 } from './db.js';
 import { discoverOpenCodeModels, discoverOpenCodeProviders } from './model-discovery.js';
-import { opencodeChannelProvisioningMigration } from './migration.js';
+import {
+  opencodeChannelProvisioningMigration,
+  opencodeChannelProvisioningResumeMigration,
+  opencodeTypedRoutesMigration,
+} from './migration.js';
+import { probeOpenCodeRoute } from './readiness-probe.js';
 import type { DiscoveredOpenCodeModel, OpenCodeModelProvider } from './types.js';
 import './cli-resource.js';
 
@@ -56,10 +63,13 @@ const INLINE_CONTEXT_PREFIX = '__inline_local_context__:';
 const INLINE_PROVIDER_PREFIX = '__inline_provider__:';
 
 registerMigration(opencodeChannelProvisioningMigration);
+registerMigration(opencodeChannelProvisioningResumeMigration);
+registerMigration(opencodeTypedRoutesMigration);
 
 onHostStart(async () => {
   const env = readEnvFile([
     'OPENCODE_PROVIDER',
+    'OPENCODE_AUTH_MODE',
     'ANTHROPIC_BASE_URL',
     'OPENCODE_MODEL_CONTEXT_LIMIT',
     'OPENCODE_MODEL_OUTPUT_LIMIT',
@@ -73,6 +83,20 @@ onHostStart(async () => {
   };
   await syncEnvironmentProvider({
     providerId,
+    auth:
+      (process.env.OPENCODE_AUTH_MODE ?? env.OPENCODE_AUTH_MODE)?.trim() === 'chatgpt'
+        ? {
+            kind: 'chatgpt_oauth',
+            credentialRef: 'onecli:OpenCode ChatGPT',
+            materializer: 'opencode_openai_auth_v1',
+          }
+        : (process.env.OPENCODE_AUTH_MODE ?? env.OPENCODE_AUTH_MODE)?.trim() === 'api_key'
+          ? {
+              kind: 'api_key',
+              credentialRef: `onecli:auto:${providerId}`,
+              injection: { kind: 'provider_native' },
+            }
+          : { kind: 'keyless' },
     baseUrl: process.env.ANTHROPIC_BASE_URL ?? env.ANTHROPIC_BASE_URL,
     contextLimit: positive(process.env.OPENCODE_MODEL_CONTEXT_LIMIT ?? env.OPENCODE_MODEL_CONTEXT_LIMIT),
     outputLimit: positive(process.env.OPENCODE_MODEL_OUTPUT_LIMIT ?? env.OPENCODE_MODEL_OUTPUT_LIMIT),
@@ -91,7 +115,7 @@ function messageText(event: InboundEvent): string {
 
 async function discover(context: ChannelAgentProvisioningContext, provider: OpenCodeModelProvider) {
   try {
-    return await discoverOpenCodeModels(provider);
+    return await discoverOpenCodeModels(provider, undefined, undefined, await ensureConnection(provider));
   } catch {
     await context.deliverText(`Could not read models from ${provider.name}. Check the connection and try again.`);
     return undefined;
@@ -560,13 +584,35 @@ registerChannelAgentProvisioner({
       const models = await discover(context, provider);
       const model = models?.find((entry) => entry.id === state.model_id);
       if (!model) return true;
-      const agent = await context.createAgent({
-        name: state.agent_name,
-        provider: 'opencode',
-        model: model.id,
-        instructions: provider.instructions ?? undefined,
-      });
-      await persistProviderSettings(agent.id, provider, model);
+      const agent = state.agent_group_id
+        ? { id: state.agent_group_id, name: state.agent_name }
+        : await context.createAgent({
+            name: state.agent_name,
+            provider: 'opencode',
+            model: model.id,
+            instructions: provider.instructions ?? undefined,
+          });
+      if (!state.agent_group_id) {
+        // Persist the created identity before probing. A retry after a host
+        // restart resumes this exact group instead of creating an orphan.
+        await updateState(context.row.messaging_group_id, {
+          step: 'awaiting_confirmation',
+          agentGroupId: agent.id,
+        });
+      }
+      const route = await persistProviderSettings(agent.id, provider, model);
+      await context.deliverText(`Testing ${route.modelRef} with the exact runtime route…`);
+      try {
+        const result = await probeOpenCodeRoute(agent.id, agent.name, route);
+        await markRouteReady(agent.id, route, result);
+      } catch (error) {
+        await context.deliverText(
+          `⚠️ OpenCode agent "${agent.name}" was created but not connected because its runtime readiness probe failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return true;
+      }
       const approverId = payload.userId?.includes(':')
         ? payload.userId
         : `${payload.channelType}:${payload.userId ?? ''}`;

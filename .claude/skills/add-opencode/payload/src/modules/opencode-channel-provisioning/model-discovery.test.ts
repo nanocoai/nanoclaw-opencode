@@ -29,6 +29,30 @@ describe('OpenCode live model discovery', () => {
     expect(models[0]).toMatchObject({ id: 'openai/qwen-local', contextLimit: 65536 });
   });
 
+  it('sends no placeholder authorization header for a typed keyless connection', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [{ id: 'qwen-local' }] }), { status: 200 }));
+    await discoverOpenCodeModels(provider(), fetchImpl, undefined, {
+      schemaVersion: 1,
+      id: 'connection-1',
+      displayName: 'Local',
+      providerId: 'openai',
+      auth: { kind: 'keyless' },
+      transport: {
+        kind: 'openai_compatible',
+        apiMode: 'chat_completions',
+        baseUrl: 'http://host.docker.internal:8891/v1',
+      },
+      discovery: { kind: 'models_endpoint', url: 'http://host.docker.internal:8891/v1/models' },
+      enabled: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://host.docker.internal:8891/v1/models',
+      expect.objectContaining({ headers: undefined }),
+    );
+  });
+
   it('discovers provider models live from Models.dev', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(
       new Response(
