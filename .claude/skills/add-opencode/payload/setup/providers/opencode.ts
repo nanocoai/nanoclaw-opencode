@@ -212,16 +212,25 @@ export function parseChatGptModelList(output: string): string[] {
 }
 
 function discoverChatGptModels(): string[] {
-  try {
-    const output = execFileSync(
-      CONTAINER_RUNTIME_BIN,
-      ['run', '--rm', '--entrypoint', 'opencode', CONTAINER_IMAGE, 'models', 'openai'],
-      { encoding: 'utf8', timeout: 60_000 },
-    );
-    const ids = parseChatGptModelList(output);
-    if (ids.length > 0) return ids;
-  } catch {
-    // fall through to the static list
+  // Host CLI first: it is signed in, so the openai provider is registered.
+  // The bare container has no auth, and an unauthenticated opencode reports
+  // "Provider not found: openai" — that path stays as a silenced fallback.
+  const attempts: Array<[string, string[]]> = [
+    ['opencode', ['models', 'openai']],
+    [CONTAINER_RUNTIME_BIN, ['run', '--rm', '--entrypoint', 'opencode', CONTAINER_IMAGE, 'models', 'openai']],
+  ];
+  for (const [command, args] of attempts) {
+    try {
+      const output = execFileSync(command, args, {
+        encoding: 'utf8',
+        timeout: 60_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const ids = parseChatGptModelList(output);
+      if (ids.length > 0) return ids;
+    } catch {
+      // try the next source
+    }
   }
   return [...OPENCODE_CHATGPT_MODELS];
 }
