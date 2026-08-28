@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  buildOneCliOAuthSecret,
   buildOpenCodeLoginArgs,
   buildOpenCodeOAuthStub,
   discoverLocalModelIds,
@@ -57,6 +58,43 @@ describe('OpenCode setup payload', () => {
         accountId: 'account-123',
       },
     });
+  });
+
+  it('vaults ChatGPT tokens in the Codex shape OneCLI classifies as oauth', () => {
+    expect(
+      buildOneCliOAuthSecret(
+        {
+          openai: {
+            type: 'oauth',
+            access: 'live-access-token',
+            refresh: 'live-refresh-token',
+            expires: 1,
+            accountId: 'account-123',
+          },
+        },
+        new Date('2026-08-29T12:00:00.000Z'),
+      ),
+    ).toEqual({
+      tokens: {
+        access_token: 'live-access-token',
+        refresh_token: 'live-refresh-token',
+        account_id: 'account-123',
+      },
+      OPENAI_API_KEY: null,
+      last_refresh: '2026-08-29T12:00:00.000Z',
+    });
+  });
+
+  it('refuses to vault a credential with no account id, which the gateway cannot route', () => {
+    const base = { type: 'oauth', access: 'a', refresh: 'r' };
+    expect(() => buildOneCliOAuthSecret({ openai: base })).toThrow('no account id');
+    expect(() => buildOneCliOAuthSecret({ openai: { ...base, accountId: '  ' } })).toThrow('no account id');
+  });
+
+  it('refuses to vault a credential with no refresh token, which the gateway cannot renew', () => {
+    expect(() =>
+      buildOneCliOAuthSecret({ openai: { type: 'oauth', access: 'a', accountId: 'account-123' } }),
+    ).toThrow('did not create an OpenAI OAuth credential');
   });
 
   it('rejects API-key auth records instead of misrepresenting them as subscription OAuth', () => {

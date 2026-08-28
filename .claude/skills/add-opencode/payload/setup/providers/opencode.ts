@@ -168,6 +168,40 @@ export function buildOpenCodeOAuthStub(authJson: unknown): Record<string, unknow
   };
 }
 
+/**
+ * Translate OpenCode's `auth.json` into the Codex-shaped OAuth record OneCLI recognises.
+ *
+ * OneCLI's ingest classifier and its gateway injector both key off
+ * `tokens.access_token` / `tokens.refresh_token`; OpenCode writes
+ * `openai.access` / `openai.refresh` / `openai.accountId` instead. Vaulting the
+ * OpenCode file verbatim is classified as an opaque api-key, so the gateway
+ * injects the whole JSON blob as a bearer and never refreshes it. Emitting this
+ * shape instead is what makes the ChatGPT credential an `oauth` secret.
+ */
+export function buildOneCliOAuthSecret(authJson: unknown, now: Date = new Date()): Record<string, unknown> {
+  if (!authJson || typeof authJson !== 'object') throw new Error('OpenCode auth.json is not an object');
+  const openai = (authJson as Record<string, unknown>).openai;
+  if (!openai || typeof openai !== 'object') throw new Error('OpenCode auth.json has no OpenAI entry');
+  const record = openai as Record<string, unknown>;
+  if (record.type !== 'oauth' || typeof record.access !== 'string' || typeof record.refresh !== 'string') {
+    throw new Error('OpenCode did not create an OpenAI OAuth credential');
+  }
+  if (typeof record.accountId !== 'string' || !record.accountId.trim()) {
+    // Without an account id the gateway cannot set `chatgpt-account-id`, and every
+    // ChatGPT request fails auth. Fail loudly rather than vault a broken record.
+    throw new Error('OpenCode ChatGPT credential has no account id — sign in again and pick a ChatGPT plan');
+  }
+  return {
+    tokens: {
+      access_token: record.access,
+      refresh_token: record.refresh,
+      account_id: record.accountId,
+    },
+    OPENAI_API_KEY: null,
+    last_refresh: now.toISOString(),
+  };
+}
+
 export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promise<void> {
   const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
   const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
@@ -189,9 +223,15 @@ export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promis
     throw new Error('OpenCode sign-in completed without writing auth.json');
   }
 
+  const vaultPath = path.join(loginDir, 'onecli-openai-oauth.json');
+  const removeVaultFile = (): void => fs.rmSync(vaultPath, { force: true });
+
   try {
     const authJson = JSON.parse(fs.readFileSync(authPath, 'utf8')) as unknown;
     const stub = buildOpenCodeOAuthStub(authJson);
+    const secret = buildOneCliOAuthSecret(authJson);
+    fs.writeFileSync(vaultPath, `${JSON.stringify(secret, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(vaultPath, 0o600);
     execFileSync(
       'onecli',
       [
@@ -202,7 +242,7 @@ export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promis
         '--type',
         'openai',
         '--file',
-        authPath,
+        vaultPath,
         '--host-pattern',
         'chatgpt.com',
       ],
@@ -213,6 +253,7 @@ export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promis
     fs.writeFileSync(stubPath, `${JSON.stringify(stub, null, 2)}\n`, { mode: 0o600 });
     fs.chmodSync(stubPath, 0o600);
   } finally {
+    removeVaultFile();
     removeLoginDir();
   }
 }
