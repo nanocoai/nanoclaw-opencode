@@ -21,7 +21,7 @@ const MANUAL_MODEL = '__manual_model__';
 const OPENCODE_AUTH_MODE = 'OPENCODE_AUTH_MODE';
 const OPENCODE_CHATGPT_STUB = path.join('data', 'opencode', 'openai-auth-stub.json');
 const ONECLI_SENTINEL = 'onecli-managed';
-export const OPENCODE_CHATGPT_MODELS = ['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.3-codex-spark'] as const;
+export const OPENCODE_CHATGPT_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6', 'gpt-5.5'] as const;
 // Far enough in the future that OpenCode never tries to exchange the sentinel
 // refresh token. OneCLI owns refresh and replaces the sentinel bearer in flight.
 const STUB_EXPIRES_AT = Date.UTC(2100, 0, 1);

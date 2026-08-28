@@ -127,7 +127,7 @@ describe('OpenCode setup payload', () => {
   });
 
   it('offers the exact ChatGPT subscription models allowed by the pinned OpenCode plugin', () => {
-    expect(OPENCODE_CHATGPT_MODELS).toEqual(['gpt-5.4', 'gpt-5.4-mini', 'gpt-5.5', 'gpt-5.3-codex-spark']);
+    expect(OPENCODE_CHATGPT_MODELS).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6', 'gpt-5.5']);
   });
 
   it('keeps the verified runtime pin and trusted postinstall together', () => {
