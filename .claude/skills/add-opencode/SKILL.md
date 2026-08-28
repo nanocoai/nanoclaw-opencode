@@ -98,13 +98,21 @@ cd container/agent-runner && bun test src/providers/opencode-registration.test.t
 pnpm exec tsx setup/index.ts --step provider-auth opencode
 ```
 
-The setup module offers ChatGPT Plus/Pro through OpenCode's native browser or
-device-pairing flow, local/self-hosted OpenAI-compatible endpoints, OpenRouter,
-DeepSeek, and a custom provider. ChatGPT login runs in the pinned agent image
-with an isolated temporary XDG directory. The live OAuth record is moved into
-OneCLI, the temporary directory is deleted, and runtime receives only a
-read-only `onecli-managed` stub. API keys are stored in OneCLI; `.env` contains
-only provider, model, typed auth mode, and optional base-URL configuration.
+The setup module reads OpenCode's live models.dev provider catalog, lets the
+operator choose any currently exposed provider and text model, and keeps local
+or custom OpenAI-compatible endpoints available alongside it. OpenAI offers
+ChatGPT Plus/Pro through OpenCode's native browser or device-pairing flow;
+other catalog providers accept an API key or an already configured/keyless
+route. Setup directly provisions single-key HTTP authentication; providers
+that require multiple cloud credentials or provider-specific OAuth must first
+be configured through OneCLI or their provider-specific setup. Known providers
+use their correct OneCLI host and header convention,
+while a future provider with no declared API URL asks for those routing details
+instead of guessing. ChatGPT login runs in the pinned agent image with an
+isolated temporary XDG directory. The live OAuth record is moved into OneCLI,
+the temporary directory is deleted, and runtime receives only a read-only
+`onecli-managed` stub. API keys are stored in OneCLI; `.env` contains only
+provider, model, typed auth mode, and optional base-URL configuration.
 On the next host start, the OpenCode module mirrors that non-secret backend
 configuration into an `Environment default` model-provider connection. Extra
 connections can be managed with `ncl opencode-model-providers`.

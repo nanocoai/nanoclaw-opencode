@@ -6,6 +6,9 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   buildOpenCodeLoginArgs,
   buildOpenCodeOAuthStub,
+  catalogCredentialDefaults,
+  catalogCredentialHost,
+  discoverOpenCodeCatalog,
   discoverLocalModelIds,
   normalizeOptionalInput,
   OPENCODE_CHATGPT_MODELS,
@@ -35,6 +38,71 @@ describe('OpenCode setup payload', () => {
   it('rejects malformed model discovery responses so the wizard can fall back to manual input', async () => {
     const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ models: [] })));
     await expect(discoverLocalModelIds('http://127.0.0.1:8891/v1', fetchImpl)).rejects.toThrow('no data array');
+  });
+
+  it('discovers the live provider catalog and keeps only text-capable models', async () => {
+    const fetchImpl = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            xai: {
+              id: 'xai',
+              name: 'xAI',
+              api: 'https://api.x.ai/v1',
+              npm: '@ai-sdk/xai',
+              models: {
+                'grok-z': { id: 'grok-z', name: 'Grok Z', modalities: { output: ['text'] } },
+                image: { id: 'image', name: 'Image', modalities: { output: ['image'] } },
+                'grok-a': { id: 'grok-a', name: 'Grok A' },
+              },
+            },
+            empty: { id: 'empty', name: 'Empty', models: {} },
+          }),
+        ),
+    );
+
+    await expect(discoverOpenCodeCatalog(fetchImpl)).resolves.toEqual([
+      {
+        id: 'xai',
+        name: 'xAI',
+        api: 'https://api.x.ai/v1',
+        npm: '@ai-sdk/xai',
+        models: [
+          { id: 'xai/grok-a', name: 'Grok A' },
+          { id: 'xai/grok-z', name: 'Grok Z' },
+        ],
+      },
+    ]);
+  });
+
+  it('rejects malformed live provider catalogs', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify([])));
+    await expect(discoverOpenCodeCatalog(fetchImpl)).rejects.toThrow('catalog is not an object');
+  });
+
+  it('uses provider-specific OneCLI injection defaults without guessing for future providers', () => {
+    expect(catalogCredentialDefaults({ id: 'anthropic', name: 'Anthropic', models: [] })).toEqual({
+      host: 'api.anthropic.com',
+      headerName: 'x-api-key',
+      valueFormat: '{value}',
+    });
+    expect(
+      catalogCredentialDefaults({
+        id: 'future-provider',
+        name: 'Future',
+        api: 'https://api.future.test/v1',
+        models: [],
+      }),
+    ).toBeUndefined();
+    expect(
+      catalogCredentialHost({
+        id: 'future-provider',
+        name: 'Future',
+        api: 'https://api.future.test/v1',
+        models: [],
+      }),
+    ).toBe('api.future.test');
+    expect(catalogCredentialDefaults({ id: 'manual-provider', name: 'Manual', models: [] })).toBeUndefined();
   });
 
   it('replaces live OAuth tokens with a non-expiring OneCLI stub and keeps account routing metadata', () => {
