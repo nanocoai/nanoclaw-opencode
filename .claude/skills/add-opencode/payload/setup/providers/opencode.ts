@@ -235,7 +235,35 @@ function discoverChatGptModels(): string[] {
   return [...OPENCODE_CHATGPT_MODELS];
 }
 
+export function hasChatGptSecret(listOutput: string): boolean {
+  try {
+    const payload = JSON.parse(listOutput) as unknown;
+    const rows = Array.isArray(payload) ? payload : ((payload as Record<string, unknown>).data as unknown[]);
+    if (!Array.isArray(rows)) return false;
+    return rows.some((row) => (row as Record<string, unknown>).name === 'OpenCode ChatGPT');
+  } catch {
+    return false;
+  }
+}
+
+function chatGptSecretExists(): boolean {
+  try {
+    const output = execFileSync('onecli', ['secrets', 'list'], {
+      encoding: 'utf8',
+      timeout: 30_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return hasChatGptSecret(output);
+  } catch {
+    return false;
+  }
+}
+
 export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promise<void> {
+  if (chatGptSecretExists()) {
+    p.log.info(brandBody('ChatGPT is already connected (OneCLI secret exists) — skipping sign-in.'));
+    return;
+  }
   const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
   const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
 

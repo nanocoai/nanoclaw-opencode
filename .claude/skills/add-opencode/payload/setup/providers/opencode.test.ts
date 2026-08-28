@@ -11,6 +11,7 @@ import {
   normalizeOptionalInput,
   OPENCODE_CHATGPT_MODELS,
   parseChatGptModelList,
+  hasChatGptSecret,
 } from './opencode.js';
 
 describe('OpenCode setup payload', () => {
@@ -154,5 +155,15 @@ describe('parseChatGptModelList', () => {
   });
   it('returns empty on unrecognized output', () => {
     expect(parseChatGptModelList('command not found')).toEqual([]);
+  });
+});
+
+describe('hasChatGptSecret', () => {
+  it('finds the secret in a data-wrapped list', () => {
+    expect(hasChatGptSecret(JSON.stringify({ data: [{ name: 'OpenCode ChatGPT' }] }))).toBe(true);
+  });
+  it('is false for other secrets or bad output', () => {
+    expect(hasChatGptSecret(JSON.stringify({ data: [{ name: 'Anthropic' }] }))).toBe(false);
+    expect(hasChatGptSecret('not json')).toBe(false);
   });
 });
