@@ -10,6 +10,7 @@ import {
   discoverLocalModelIds,
   normalizeOptionalInput,
   OPENCODE_CHATGPT_MODELS,
+  parseChatGptModelList,
 } from './opencode.js';
 
 describe('OpenCode setup payload', () => {
@@ -143,5 +144,15 @@ describe('OpenCode setup payload', () => {
     const cli = tools.find((entry) => entry.name === 'opencode-ai');
     expect(cli).toEqual({ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true });
     expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.18.25');
+  });
+});
+
+describe('parseChatGptModelList', () => {
+  it('extracts and de-duplicates openai gpt model ids', () => {
+    const out = 'openai/gpt-5.6-sol\nopenai/gpt-5.6-terra\nopenai/gpt-5.6-sol\nopenai/o4-mini\nnoise\n';
+    expect(parseChatGptModelList(out)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra']);
+  });
+  it('returns empty on unrecognized output', () => {
+    expect(parseChatGptModelList('command not found')).toEqual([]);
   });
 });

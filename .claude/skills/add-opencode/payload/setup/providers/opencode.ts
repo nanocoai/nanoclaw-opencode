@@ -202,6 +202,30 @@ export function buildOneCliOAuthSecret(authJson: unknown, now: Date = new Date()
   };
 }
 
+export function parseChatGptModelList(output: string): string[] {
+  const ids = output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /^openai\/gpt-/.test(line))
+    .map((line) => line.slice('openai/'.length));
+  return [...new Set(ids)];
+}
+
+function discoverChatGptModels(): string[] {
+  try {
+    const output = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['run', '--rm', '--entrypoint', 'opencode', CONTAINER_IMAGE, 'models', 'openai'],
+      { encoding: 'utf8', timeout: 60_000 },
+    );
+    const ids = parseChatGptModelList(output);
+    if (ids.length > 0) return ids;
+  } catch {
+    // fall through to the static list
+  }
+  return [...OPENCODE_CHATGPT_MODELS];
+}
+
 export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promise<void> {
   const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
   const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
@@ -357,7 +381,7 @@ export async function runOpenCodeAuthStep(): Promise<void> {
 
   let discoveredModels: string[] = [];
   if (backend === 'chatgpt') {
-    discoveredModels = [...OPENCODE_CHATGPT_MODELS];
+    discoveredModels = discoverChatGptModels();
   } else if (backend === 'local') {
     try {
       discoveredModels = await discoverLocalModelIds(baseUrl);
