@@ -575,7 +575,7 @@ export const QUESTION_STEERING_TEXT =
  * stop reaching anyone. Re-state it, with the live destination list, so the
  * next turn routes correctly.
  *
- * OpenCode 1.18.21 exposes no compaction-prompt/customInstructions config API,
+ * OpenCode 1.18.25 exposes no compaction-prompt/customInstructions config API,
  * so unlike the Claude provider's PreCompact hook we cannot steer the summary
  * itself. We re-inject on the next prompt instead. Destinations are read fresh
  * at injection time.

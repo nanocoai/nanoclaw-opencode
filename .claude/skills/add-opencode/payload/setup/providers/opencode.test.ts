@@ -141,7 +141,7 @@ describe('OpenCode setup payload', () => {
       dependencies?: Record<string, string>;
     };
     const cli = tools.find((entry) => entry.name === 'opencode-ai');
-    expect(cli).toEqual({ name: 'opencode-ai', version: '1.18.21', onlyBuilt: true });
-    expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.18.21');
+    expect(cli).toEqual({ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true });
+    expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.18.25');
   });
 });

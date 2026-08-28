@@ -67,11 +67,11 @@ The CLI and SDK are one tested pair. OpenCode's package requires its trusted
 postinstall so the platform binary is present in the image.
 
 ```nc:dep manager:bun cwd:container/agent-runner
-@opencode-ai/sdk@1.18.21
+@opencode-ai/sdk@1.18.25
 ```
 
 ```nc:json-merge into:container/cli-tools.json key:name
-{ "name": "opencode-ai", "version": "1.18.21", "onlyBuilt": true }
+{ "name": "opencode-ai", "version": "1.18.25", "onlyBuilt": true }
 ```
 
 ### 4. Build and validate
@@ -150,7 +150,7 @@ text and are never fetched implicitly.
 - `Unknown provider: opencode`: re-run this skill; a barrel import is missing.
 - `spawn opencode ENOENT`: rebuild the image after applying the skill.
 - Custom endpoint fails after the first turn: include `/v1` and use provider `openai`.
-- Version mismatch: reapply the skill so CLI and SDK both return to 1.18.21.
+- Version mismatch: reapply the skill so CLI and SDK both return to 1.18.25.
 
 ## Provider-contract compatibility
 

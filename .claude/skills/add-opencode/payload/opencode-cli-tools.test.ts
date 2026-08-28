@@ -25,7 +25,7 @@ describe('OpenCode CLI and SDK pins', () => {
 
   it('installs opencode-ai from the pinned global CLI manifest', () => {
     const entry = tools.find((tool) => tool.name === 'opencode-ai');
-    expect(entry).toEqual({ name: 'opencode-ai', version: '1.18.21', onlyBuilt: true });
+    expect(entry).toEqual({ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true });
   });
 
   it('keeps the global CLI and agent-runner SDK on the same exact version', () => {

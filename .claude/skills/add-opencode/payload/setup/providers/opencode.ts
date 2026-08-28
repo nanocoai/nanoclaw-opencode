@@ -447,8 +447,8 @@ export async function checkOpenCodeInstall(): Promise<void> {
     onlyBuilt?: boolean;
   }>;
   const cli = tools.find((entry) => entry.name === 'opencode-ai');
-  if (cli?.version !== '1.18.21' || cli.onlyBuilt !== true) {
-    throw new Error('OpenCode CLI must be pinned to 1.18.21 with trusted postinstall enabled');
+  if (cli?.version !== '1.18.25' || cli.onlyBuilt !== true) {
+    throw new Error('OpenCode CLI must be pinned to 1.18.25 with trusted postinstall enabled');
   }
 }
 
