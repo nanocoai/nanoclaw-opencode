@@ -7,3 +7,4 @@
 // self-registration import below.
 
 import './cli.js';
+import './mattermost.js';

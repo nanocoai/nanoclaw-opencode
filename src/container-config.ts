@@ -248,6 +248,7 @@ export interface ContainerConfig {
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
   model?: string;
+  providerSettings?: unknown;
   effort?: string;
   timezone?: string;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
@@ -369,6 +370,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
+    providerSettings: row.provider_settings ? JSON.parse(row.provider_settings) : undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),

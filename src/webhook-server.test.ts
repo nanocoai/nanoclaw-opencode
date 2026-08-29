@@ -9,6 +9,9 @@
  * fixed WEBHOOK_PORT, real fetch.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import type { Chat } from 'chat';
 
@@ -57,6 +60,25 @@ afterEach(async () => {
 });
 
 describe('registerWebhookAdapter — route/handler split', () => {
+  it('reads WEBHOOK_PORT from .env when it is absent from process.env', async () => {
+    const originalCwd = process.cwd();
+    const root = mkdtempSync(join(tmpdir(), 'nanoclaw-webhook-'));
+    writeFileSync(join(root, '.env'), `WEBHOOK_PORT=${PORT}\n`);
+    delete process.env.WEBHOOK_PORT;
+    process.chdir(root);
+
+    try {
+      const { chat } = stubChat('dotenv');
+      registerWebhookAdapter(chat, 'slack');
+      const res = await post('/webhook/slack', 'from-dotenv');
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ via: 'dotenv' });
+    } finally {
+      process.chdir(originalCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('2-arg default: /webhook/<adapterName> dispatches to chat.webhooks[adapterName]', async () => {
     const { chat, calls } = stubChat('default');
     registerWebhookAdapter(chat, 'slack');

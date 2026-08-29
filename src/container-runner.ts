@@ -448,6 +448,8 @@ async function resolveProviderContribution(
         agentGroupId: agentGroup.id,
         groupDir: path.resolve(GROUPS_DIR, agentGroup.folder),
         selectedSkills: selectedSkillNames(containerConfig),
+        model: containerConfig.model,
+        providerSettings: containerConfig.providerSettings,
         hostEnv: process.env,
       })
     : {};
