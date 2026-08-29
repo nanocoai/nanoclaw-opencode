@@ -105,6 +105,11 @@ describe('opencode provider host registration', () => {
   it('mounts the OneCLI-only ChatGPT auth stub at OpenCode native auth.json', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-chatgpt-registration-'));
     const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
+    // DATA_DIR is the LIVE install's data directory, not a fixture. A real
+    // install keeps its ChatGPT credential stub here, so stash it and put it
+    // back — otherwise running the suite silently destroys the credential and
+    // every ChatGPT-auth group then fails to spawn with "stub is missing".
+    const preexistingStub = fs.existsSync(stubPath) ? fs.readFileSync(stubPath) : null;
     try {
       fs.mkdirSync(path.dirname(stubPath), { recursive: true });
       fs.writeFileSync(stubPath, '{"openai":{"type":"oauth","access":"onecli-managed"}}');
@@ -124,7 +129,8 @@ describe('opencode provider host registration', () => {
       });
       expect(fs.statSync(path.join(root, 'session', 'opencode-xdg', 'opencode', 'auth.json')).isFile()).toBe(true);
     } finally {
-      fs.rmSync(stubPath, { force: true });
+      if (preexistingStub) fs.writeFileSync(stubPath, preexistingStub, { mode: 0o600 });
+      else fs.rmSync(stubPath, { force: true });
       fs.rmSync(root, { recursive: true, force: true });
     }
   });
