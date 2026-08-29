@@ -11,6 +11,8 @@ import type { McpServerConfig } from './providers/types.js';
 
 const CONFIG_PATH = '/workspace/agent/container.json';
 
+export type DeliveryMode = 'envelope' | 'tools-only';
+
 export interface RunnerConfig {
   provider: string;
   assistantName: string;
@@ -20,6 +22,7 @@ export interface RunnerConfig {
   mcpServers: Record<string, McpServerConfig>;
   model?: string;
   effort?: string;
+  deliveryMode: DeliveryMode;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -49,6 +52,7 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,
+    deliveryMode: raw.deliveryMode === 'tools-only' ? 'tools-only' : 'envelope',
   };
 
   return _config;

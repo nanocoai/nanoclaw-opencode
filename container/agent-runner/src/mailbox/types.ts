@@ -54,6 +54,7 @@ export interface MailboxOperations {
   getRoutingBySeq(sequence: number): SessionRouting | null;
   getLatestInboundRoute(channelType: string, platformId: string): { threadId: string | null; inReplyTo: string } | null;
   getUndeliveredMessages(): OutboundMessage[];
+  getOutboundMessagesAfter(sequence: number): OutboundMessage[];
   getState(key: string): StateValue | undefined;
   setState(key: string, value: string): void;
   deleteState(key: string): void;

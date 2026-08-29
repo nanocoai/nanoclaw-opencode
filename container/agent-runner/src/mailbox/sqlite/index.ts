@@ -19,6 +19,7 @@ import {
   sqliteGetSessionRouting,
   sqliteGetState,
   sqliteGetUndeliveredMessages,
+  sqliteGetOutboundMessagesAfter,
   sqliteMarkCompleted,
   sqliteMarkFailed,
   sqliteMarkProcessing,
@@ -178,6 +179,10 @@ export class SqliteAgentMailbox implements AgentMailbox {
 
   getUndeliveredMessages(): OutboundMessage[] {
     return sqliteGetUndeliveredMessages().map(outboundMessage);
+  }
+
+  getOutboundMessagesAfter(sequence: number): OutboundMessage[] {
+    return sqliteGetOutboundMessagesAfter(sequence).map(outboundMessage);
   }
 
   getState(key: string) {

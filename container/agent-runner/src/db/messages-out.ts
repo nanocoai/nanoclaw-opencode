@@ -125,3 +125,25 @@ export function getRoutingBySeq(
 export function getUndeliveredMessages(): MessageOutRow[] {
   return getAgentMailbox().operations.getUndeliveredMessages().map(messageRow);
 }
+
+export function getOutboundMessagesAfter(sequence: number): MessageOutRow[] {
+  return getAgentMailbox().operations.getOutboundMessagesAfter(sequence).map(messageRow);
+}
+
+export function getMaxOutboundSeq(): number {
+  const rows = getOutboundMessagesAfter(0);
+  return rows.reduce((max, row) => Math.max(max, row.seq ?? 0), 0);
+}
+
+export function getDeliveredSeqSince(sequence: number): number {
+  return getOutboundMessagesAfter(sequence).reduce((max, row) => {
+    if (row.kind !== 'chat' && row.kind !== 'chat-sdk') return max;
+    try {
+      const payload = JSON.parse(row.content) as { operation?: string };
+      if (payload.operation === 'edit' || payload.operation === 'reaction') return max;
+    } catch {
+      // An unparsable chat row is still user-visible delivery evidence.
+    }
+    return Math.max(max, row.seq ?? 0);
+  }, 0);
+}

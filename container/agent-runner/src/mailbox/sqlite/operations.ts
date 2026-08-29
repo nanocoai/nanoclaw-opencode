@@ -213,6 +213,12 @@ export function sqliteGetUndeliveredMessages(): MessageOutRow[] {
     .all() as MessageOutRow[];
 }
 
+export function sqliteGetOutboundMessagesAfter(sequence: number): MessageOutRow[] {
+  return getOutboundDb()
+    .prepare('SELECT * FROM messages_out WHERE seq > ? ORDER BY seq ASC')
+    .all(sequence) as MessageOutRow[];
+}
+
 export function sqliteGetSessionRouting(): SessionRouting {
   const db = getInboundDb();
   const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'session_routing'").get();

@@ -10,19 +10,31 @@
  *   "command": "bun /app/src/compact-instructions.ts"
  */
 import { getAllDestinations } from './destinations.js';
+import { loadConfig, type DeliveryMode } from './config.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 
-export function buildCompactInstructions(names: string[], taskId: string | null): string {
+export function buildCompactInstructions(
+  names: string[],
+  taskId: string | null,
+  deliveryMode: DeliveryMode = 'envelope',
+): string {
+  const chatReminder =
+    deliveryMode === 'tools-only'
+      ? [
+          '   "Only real outbound tool calls deliver. Response prose and <message> blocks are private scratchpad.',
+          `   Available destinations: ${formatDestinationNames(names)}."`,
+        ]
+      : [
+          '   "You MUST wrap all responses in <message to="name">...</message> blocks.',
+          `   Available destinations: ${formatDestinationNames(names)}."`,
+        ];
   const deliveryReminder = taskId
     ? [
         '   "This is an isolated task run. If you need to send the user a message, use send_message with an explicit to destination.',
         `   Final output is not delivered; it becomes the automatic summary in tasks/${taskId}.md.`,
         `   Available destinations: ${formatDestinationNames(names)}."`,
       ]
-    : [
-        '   "You MUST wrap all responses in <message to="name">...</message> blocks.',
-        `   Available destinations: ${formatDestinationNames(names)}."`,
-      ];
+    : chatReminder;
 
   return [
     'Preserve the following in the compaction summary:',
@@ -47,5 +59,5 @@ function formatDestinationNames(names: string[]): string {
 
 if (import.meta.main) {
   const names = getAllDestinations().map((destination) => destination.name);
-  console.log(buildCompactInstructions(names, getTaskSeriesId()));
+  console.log(buildCompactInstructions(names, getTaskSeriesId(), loadConfig().deliveryMode));
 }

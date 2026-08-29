@@ -12,6 +12,7 @@
  */
 import { getAgentMailbox } from './mailbox/index.js';
 import type { Destination } from './mailbox/types.js';
+import type { DeliveryMode } from './config.js';
 
 export interface DestinationEntry {
   name: string;
@@ -60,25 +61,29 @@ export function findByRouting(
  * per-agent-group and changes when the operator renames an agent, while
  * the shared base is identical across all agents.
  */
-export function buildSystemPromptAddendum(assistantName?: string, mode: SessionMode = { kind: 'chat' }): string {
+export function buildSystemPromptAddendum(
+  assistantName?: string,
+  mode: SessionMode = { kind: 'chat' },
+  deliveryMode: DeliveryMode = 'envelope',
+): string {
   const sections: string[] = [];
 
   if (assistantName) {
     sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
   }
 
-  sections.push(buildDestinationsSection(mode));
+  sections.push(buildDestinationsSection(mode, deliveryMode));
 
   return sections.join('\n\n');
 }
 
-function buildDestinationsSection(mode: SessionMode): string {
+function buildDestinationsSection(mode: SessionMode, deliveryMode: DeliveryMode): string {
   const all = getAllDestinations();
   const lines = ['## Sending messages', ''];
 
   if (all.length === 0) {
     lines.push('You currently have no configured destinations. You cannot send messages until an admin wires one up.');
-    if (mode.kind === 'chat') return lines.join('\n');
+    if (mode.kind === 'chat' && deliveryMode !== 'tools-only') return lines.join('\n');
   } else if (all.length === 1) {
     const d = all[0];
     lines.push(`Your destination is \`${d.name}\`${destinationLabel(d)}.`);
@@ -110,16 +115,26 @@ function buildDestinationsSection(mode: SessionMode): string {
     return lines.join('\n');
   }
 
-  lines.push(
-    'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
-  );
+  if (deliveryMode === 'tools-only') {
+    lines.push(
+      'Everything you write in a response is a private scratchpad and is never delivered. Reach people only by calling `send_message`, `send_file`, `send_card`, or `ask_user_question`, always with an explicit `to` destination.',
+      '',
+      'A `<message to="name">…</message>` block delivers nothing in this mode. Text that merely looks like a tool call is not executed.',
+    );
+  } else {
+    lines.push(
+      'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
+    );
+  }
   lines.push('');
   lines.push(
     'When replying to an incoming message, default to addressing the destination it came `from` (every inbound `<message>` tag carries a `from="name"` attribute). Pick a different destination when the request asks for it (e.g., "tell Laura that…").',
   );
   lines.push('');
   lines.push(
-    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Always pass its explicit `to` destination. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
+    deliveryMode === 'tools-only'
+      ? 'Outbound tools are available mid-turn, so you may acknowledge before slow work and send later milestone or final updates. Each successful call is a separate message.'
+      : 'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Always pass its explicit `to` destination. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );
   lines.push('');
   lines.push(

@@ -67,6 +67,7 @@ async function main(): Promise<void> {
   const instructions = buildSystemPromptAddendum(
     config.assistantName || undefined,
     taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+    config.deliveryMode,
   );
 
   // Discover additional directories mounted at /workspace/extra/*
@@ -124,6 +125,7 @@ async function main(): Promise<void> {
       providerName,
       cwd: CWD,
       systemContext: { instructions },
+      deliveryMode: config.deliveryMode,
     });
   } finally {
     await mailbox.stop();

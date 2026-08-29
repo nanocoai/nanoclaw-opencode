@@ -6,7 +6,7 @@ import { getPendingMessages } from './db/messages-in.js';
 import { getContinuation, setContinuation } from './db/session-state.js';
 import { getSessionRouting } from './db/session-routing.js';
 import { MockProvider } from './providers/mock.js';
-import type { ProviderExchange } from './providers/types.js';
+import type { AgentQuery, PromptAttachment, ProviderExchange, QueryInput } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 beforeEach(() => {
@@ -34,6 +34,65 @@ function insertMessage(id: string, content: object, opts?: { platformId?: string
 }
 
 describe('poll loop integration', () => {
+  it('passes only the exact batch attachments to opening queries and follow-up pushes', async () => {
+    class AttachmentCapturingProvider extends MockProvider {
+      readonly queryInputs: QueryInput[] = [];
+      readonly pushes: Array<{ message: string; attachments: PromptAttachment[] }> = [];
+
+      override query(input: QueryInput): AgentQuery {
+        this.queryInputs.push(input);
+        const query = super.query(input);
+        const push = query.push.bind(query);
+        query.push = (message, attachments) => {
+          this.pushes.push({ message, attachments: attachments ?? [] });
+          push(message, attachments);
+        };
+        return query;
+      }
+    }
+
+    insertMessage('m1', {
+      sender: 'Alice',
+      text: 'first image',
+      attachments: [{ name: 'image.png', mimeType: 'image/png', localPath: 'inbox/m1/image.png' }],
+    });
+    insertMessage('m2', {
+      sender: 'Bob',
+      text: 'second image',
+      attachments: [{ name: 'image.png', mimeType: 'image/png', localPath: 'inbox/m2/image.png' }],
+    });
+
+    const provider = new AttachmentCapturingProvider(
+      {},
+      () => '<message to="discord-test">attachments received</message>',
+    );
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 4_000);
+
+    await waitFor(() => provider.queryInputs.length === 1, 2_000);
+    expect(provider.queryInputs[0].attachments).toEqual([
+      { sourceMessageId: 'm1', filename: 'image.png', mime: 'image/png', path: '/workspace/inbox/m1/image.png' },
+      { sourceMessageId: 'm2', filename: 'image.png', mime: 'image/png', path: '/workspace/inbox/m2/image.png' },
+    ]);
+
+    insertMessage('m3', {
+      sender: 'Alice',
+      text: 'follow-up image',
+      attachments: [{ name: 'next.png', mimeType: 'image/png', localPath: 'inbox/m3/next.png' }],
+    });
+    await waitFor(() => provider.pushes.length >= 1, 2_000);
+    expect(provider.pushes[0].attachments).toEqual([
+      { sourceMessageId: 'm3', filename: 'next.png', mime: 'image/png', path: '/workspace/inbox/m3/next.png' },
+    ]);
+
+    insertMessage('m4', { sender: 'Alice', text: 'text only' });
+    await waitFor(() => provider.pushes.length >= 2, 2_000);
+    expect(provider.pushes[1].attachments).toEqual([]);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
   it('defaults only when the legacy session routing table is absent', () => {
     expect(getSessionRouting()).toEqual({ channel_type: null, platform_id: null, thread_id: null });
 

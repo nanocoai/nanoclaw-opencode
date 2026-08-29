@@ -6,7 +6,13 @@ import {
   markScriptSkipped,
   type MessageInRow,
 } from './db/messages-in.js';
-import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
+import {
+  getDeliveredSeqSince,
+  getMaxOutboundSeq,
+  getOutboundMessagesAfter,
+  getUndeliveredMessages,
+  writeMessageOut,
+} from './db/messages-out.js';
 import { clearStaleProcessingAcks } from './db/container-state.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { getAgentMailbox } from './mailbox/index.js';
@@ -19,20 +25,26 @@ import {
 } from './db/session-state.js';
 import {
   formatMessages,
+  extractPromptAttachments,
   extractRouting,
+  replyTargetsFor,
   categorizeMessage,
   isClearCommand,
   isRunnerCommand,
   isSessionEcho,
   stripInternalTags,
   type RoutingContext,
+  type ReplyTarget,
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import type { DeliveryMode } from './config.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+const TOOLS_ONLY_ERROR_NOTICE = "Something went wrong on my side and I couldn't finish that one.";
+const TOOLS_ONLY_PLACEHOLDER = "I couldn't put a reply together for that one. Try asking again.";
 
 /** Consecutive driver-classified failures before a fresh runner is required. */
 const MAILBOX_FAILURE_STREAK_EXIT = 10;
@@ -57,6 +69,7 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  deliveryMode?: DeliveryMode;
   /**
    * Optional stop signal. In production the loop runs until the container
    * dies; tests pass a signal so an abandoned loop actually exits instead of
@@ -218,11 +231,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    // Commands and script-gated rows are not part of this provider turn and
+    // must never become tools-only recovery targets.
+    const queryRouting = extractRouting(keep);
+    // Snapshot before provider.query(): providers may begin work eagerly.
+    const deliveryBaseline = getMaxOutboundSeq();
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
     const query = config.provider.query({
       prompt,
+      attachments: extractPromptAttachments(keep),
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -232,7 +251,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    setCurrentInReplyTo(queryRouting.inReplyTo);
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -246,13 +265,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     try {
       const result = await processQuery(
         query,
-        routing,
+        queryRouting,
         processingIds,
         config.providerName,
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
         config.provider.emitsMidTurnText === true,
+        config.deliveryMode ?? 'envelope',
+        deliveryBaseline,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -271,15 +292,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      await writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Tools-only mode never forwards raw provider/runtime text. Only a
+      // triggering human chat gets the fixed notice; task, webhook and
+      // agent-to-agent wakes remain delivery-inert.
+      if (config.deliveryMode !== 'tools-only') {
+        await writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: queryRouting.platformId,
+          channel_type: queryRouting.channelType,
+          thread_id: queryRouting.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
 
       // The batch is still acked completed below (no redelivery). Without
       // this line the only log trace of the errored turn is "Query error"
@@ -353,10 +378,16 @@ export async function processQuery(
    * delivery-inert and the final result stays the single delivery door.
    */
   emitsMidTurnText = false,
+  deliveryMode: DeliveryMode = 'envelope',
+  initialDeliveryBaseline?: number,
 ): Promise<QueryResult> {
+  const toolsOnly = deliveryMode === 'tools-only' && !routing.taskRun;
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  const outstanding: Array<{ target: ReplyTarget; nudged: boolean }> =
+    toolsOnly ? (routing.replyTargets ?? []).map((target) => ({ target, nudged: false })) : [];
+  let lastJudgedSeq = initialDeliveryBaseline ?? getMaxOutboundSeq();
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
   let taskBlockNudged = false;
@@ -484,7 +515,10 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        query.push(prompt);
+        if (toolsOnly) {
+          for (const target of replyTargetsFor(keep)) outstanding.push({ target, nudged: false });
+        }
+        query.push(prompt, extractPromptAttachments(keep));
         archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
@@ -541,7 +575,7 @@ export async function processQuery(
         // provider's static capability: for a provider that does not declare
         // emitsMidTurnText the result stays the only delivery door, so a
         // stray text event must not open a second one.
-        if (emitsMidTurnText) {
+        if (emitsMidTurnText && !toolsOnly) {
           const scan = await deliverMidTurnBlocks(event.text, routing, turnStartSeq, midTurnTail);
           midTurnSent += scan.delivered;
           midTurnTail = scan.tail;
@@ -554,7 +588,22 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.text) {
+        if (toolsOnly && event.isError === true) {
+          log(`Tools-only provider error (not forwarded): ${(event.text ?? '').slice(0, 500)}`);
+          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+          for (const { target } of outstanding) {
+            lastJudgedSeq = await writeToReplyTarget(target, TOOLS_ONLY_ERROR_NOTICE);
+          }
+          outstanding.length = 0;
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: event.text ?? '',
+            continuation: queryContinuation ?? initialContinuation,
+            status: 'error',
+          });
+          archivePrompts.shift();
+        } else if (event.text) {
+          const exchangePrompt = archivePrompts[0] ?? initialPrompt;
           const { sent, hasUnwrapped, taskBlocks, resultBlocks } = await dispatchResultText(event.text, routing, {
             midTurnSent,
             // For emitsMidTurnText providers the result door NEVER delivers
@@ -569,6 +618,7 @@ export async function processQuery(
             // carries content, the wrap-nudge fires so the model re-sends
             // and the retry streams through the mid-turn door.
             turnDelivered: emitsMidTurnText ? midTurnSent > 0 || chatRowWrittenSince(turnStartSeq) : undefined,
+            deliveryMode,
           });
           const willRetryTaskBlocks = shouldNudgeTaskBlocks(routing.taskRun, taskBlocks, taskBlockNudged);
           // One-door task delivery: the final text becomes the run log entry
@@ -577,7 +627,31 @@ export async function processQuery(
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text);
-          if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
+          if (toolsOnly) {
+            const beforeCount = outstanding.length;
+            lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+            const anyDelivered = outstanding.length < beforeCount;
+            const spent = outstanding.filter((entry) => entry.nudged);
+            for (const { target } of spent) {
+              lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
+            }
+            if (spent.length > 0) {
+              const spentSet = new Set(spent);
+              outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !spentSet.has(entry)));
+            }
+            const retried = outstanding.length > 0;
+            if (retried) {
+              outstanding.forEach((entry) => (entry.nudged = true));
+              query.push(buildToolsOnlyNudge(event.text, taskBlocks));
+            }
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: exchangePrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: outstanding.length === 0 && anyDelivered ? 'completed' : 'undelivered',
+            });
+            if (!retried) archivePrompts.shift();
+          } else if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
@@ -627,6 +701,22 @@ export async function processQuery(
             // not the nudge text.
             if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
           }
+        } else if (toolsOnly) {
+          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+          const spent = outstanding.filter((entry) => entry.nudged);
+          for (const { target } of spent) {
+            lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
+          }
+          if (spent.length > 0) {
+            const spentSet = new Set(spent);
+            outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !spentSet.has(entry)));
+          }
+          if (outstanding.length > 0) {
+            outstanding.forEach((entry) => (entry.nudged = true));
+            query.push(buildToolsOnlyNudge('', []));
+          } else {
+            archivePrompts.shift();
+          }
         } else archivePrompts.shift();
         // Turn boundary: reset the per-turn sent count after the result's
         // nudge decision has used it. A nudge retry re-counts via its own
@@ -644,6 +734,13 @@ export async function processQuery(
     }
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
+    if (toolsOnly) {
+      lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+      for (const { target } of outstanding) {
+        lastJudgedSeq = await writeToReplyTarget(target, TOOLS_ONLY_ERROR_NOTICE);
+      }
+      outstanding.length = 0;
+    }
     notifyExchangeComplete(onExchangeComplete, {
       prompt: archivePrompts[0] ?? initialPrompt,
       result: `Error: ${errMsg}`,
@@ -669,6 +766,69 @@ function notifyExchangeComplete(
   } catch (err) {
     log(`onExchangeComplete failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+}
+
+function buildToolsOnlyNudge(resultText: string, inertBlocks: TaskMessageBlock[]): string {
+  const prose = resultText.trim().length > 0 ? ' Your prose was not delivered.' : '';
+  const blocks =
+    inertBlocks.length > 0
+      ? ' Your <message> blocks were inert because this group sends only through outbound messaging tools.'
+      : '';
+  return (
+    '<system>No user-visible message was sent for the triggering human request.' +
+    prose +
+    blocks +
+    ' Use an outbound messaging tool now to send the reply to the exact requesting destination. Do not merely describe it.</system>'
+  );
+}
+
+async function writeToReplyTarget(target: ReplyTarget, text: string): Promise<number> {
+  return writeMessageOut({
+    id: generateId(),
+    in_reply_to: target.inReplyTo,
+    kind: 'chat',
+    platform_id: target.platformId,
+    channel_type: target.channelType,
+    thread_id: target.threadId,
+    content: JSON.stringify({ text }),
+  });
+}
+
+function deliverToolsOnlyPlaceholder(target: ReplyTarget): Promise<number> {
+  log('Tools-only retry remained dry — delivering fixed placeholder to the triggering human');
+  return writeToReplyTarget(target, TOOLS_ONLY_PLACEHOLDER);
+}
+
+function reconcileToolsOnlyDeliveries(
+  outstanding: Array<{ target: ReplyTarget; nudged: boolean }>,
+  afterSeq: number,
+): number {
+  const rows = getOutboundMessagesAfter(afterSeq);
+  let highWater = afterSeq;
+  const delivered = new Set<number>();
+  for (const row of rows) {
+    highWater = Math.max(highWater, row.seq ?? 0);
+    if (row.kind !== 'chat' && row.kind !== 'chat-sdk') continue;
+    try {
+      const payload = JSON.parse(row.content) as { operation?: string };
+      if (payload.operation === 'edit' || payload.operation === 'reaction') continue;
+    } catch {
+      // Unparseable chat content is still a visible outbound message.
+    }
+    outstanding.forEach(({ target }, index) => {
+      const exactReply = row.in_reply_to !== null && row.in_reply_to === target.inReplyTo;
+      const exactRoute =
+        row.platform_id === target.platformId &&
+        row.channel_type === target.channelType &&
+        row.thread_id === target.threadId;
+      if (exactReply || exactRoute) delivered.add(index);
+    });
+  }
+  if (delivered.size > 0) {
+    const remaining = outstanding.filter((_entry, index) => !delivered.has(index));
+    outstanding.splice(0, outstanding.length, ...remaining);
+  }
+  return highWater;
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -725,6 +885,7 @@ export interface TaskMessageBlock {
 
 /** Options for `dispatchResultText`, describing the turn it closes. */
 export interface ResultDispatchOptions {
+  deliveryMode?: DeliveryMode;
   /**
    * How many <message> blocks were already delivered from streamed text
    * events this turn. Folds into the returned `sent` total so a bare final
@@ -912,7 +1073,7 @@ function trailingTagPrefixStart(masked: string): number {
 
 /** Current outbound seq high-water mark (0 when the table is empty). */
 function maxOutboundSeq(): number {
-  return getUndeliveredMessages().reduce((max, message) => Math.max(max, message.seq ?? 0), 0);
+  return getMaxOutboundSeq();
 }
 
 /**
@@ -926,7 +1087,7 @@ function maxOutboundSeq(): number {
 function chatRowWrittenSince(afterSeq: number): boolean {
   try {
     // ponytail: reuse the existing semantic read; add a cursor operation only if history scans show up in profiles.
-    return getUndeliveredMessages().some((message) => (message.seq ?? 0) > afterSeq && message.kind === 'chat');
+    return getDeliveredSeqSince(afterSeq) > 0;
   } catch (err) {
     log(`chatRowWrittenSince failed: ${err instanceof Error ? err.message : String(err)}`);
     return false;
@@ -970,6 +1131,7 @@ export async function dispatchResultText(
   routing: RoutingContext,
   options?: ResultDispatchOptions,
 ): Promise<{ sent: number; hasUnwrapped: boolean; taskBlocks: TaskMessageBlock[]; resultBlocks: number }> {
+  const deliveryMode = options?.deliveryMode ?? 'envelope';
   // <internal> spans are not-for-delivery scratchpad. Remove them BEFORE block
   // extraction so a <message> drafted inside one is never delivered from the
   // final text either — the mid-turn seam already guarantees this; without the
@@ -1007,10 +1169,10 @@ export async function dispatchResultText(
     // A final-text <message to> block here is either an echo of a tool send the
     // agent already made (the double-delivery class) or a send down the wrong
     // path — never deliver it, keep it visible in the scratchpad/run log.
-    if (routing.taskRun) {
-      log(`Task run: <message to="${toName}"> block not delivered — task sessions send only via explicit tools`);
+    if (routing.taskRun || deliveryMode === 'tools-only') {
+      log(`<message to="${toName}"> block not delivered — this session sends only via explicit tools`);
       scratchpadParts.push(
-        `[not delivered — task sessions send only via the send_message tool; to="${toName}"] ${body}`,
+        `[not delivered — this session sends only via explicit tools; to="${toName}"] ${body}`,
       );
       taskBlocks.push({ to: toName, body });
       continue;
@@ -1066,7 +1228,7 @@ export async function dispatchResultText(
   // turnDelivered (door deliveries + DB-visible sends like MCP send_message);
   // otherwise by this dispatch's own send count.
   const anythingDelivered = options?.suppressDelivery ? options.turnDelivered === true : sent > 0;
-  const hasUnwrapped = !routing.taskRun && !anythingDelivered && !!scratchpad;
+  const hasUnwrapped = !routing.taskRun && deliveryMode !== 'tools-only' && !anythingDelivered && !!scratchpad;
   if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
