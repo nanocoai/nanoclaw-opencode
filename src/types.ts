@@ -25,6 +25,7 @@ export interface ContainerConfigRow {
   packages_npm: string; // JSON: string[]
   additional_mounts: string; // JSON: AdditionalMountConfig[]
   cli_scope: string; // 'disabled' | 'group' | 'global'
+  delivery_mode: string | null; // 'envelope' | 'tools-only'; NULL = envelope
   timezone: string | null; // IANA id; NULL = follow the install-global timezone
   /** Optional module-owned JSON settings added by provider skills. */
   provider_settings?: string;

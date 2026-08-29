@@ -33,11 +33,23 @@
  * safe — worst case we round-trip redundantly.
  */
 import { getChannelAdapter, getChannelAdapterExact } from '../../channels/channel-registry.js';
+import type { InboundEvent } from '../../channels/adapter.js';
 import { getMessagingGroup, getMessagingGroupByPlatform, createMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, User } from '../../types.js';
 import { getUser } from './db/users.js';
 import { getUserDm, upsertUserDm } from './db/user-dms.js';
+
+/** Read-only exact match against the user's already-resolved DM address. */
+export async function isCachedUserDmEvent(userId: string, event: InboundEvent): Promise<boolean> {
+  const cached = await getUserDm(userId, event.channelType);
+  if (!cached) return false;
+  const dm = await getMessagingGroup(cached.messaging_group_id);
+  if (!dm) return false;
+  return (
+    event.platformId === dm.platform_id && (event.instance ?? event.channelType) === (dm.instance ?? dm.channel_type)
+  );
+}
 
 /**
  * Return a messaging_group usable to DM this user, creating it lazily if

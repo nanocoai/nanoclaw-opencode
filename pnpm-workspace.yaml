@@ -5,3 +5,7 @@ onlyBuiltDependencies:
 
 pnpm:
   minimumReleaseAge: 4320
+  minimumReleaseAgeExclude:
+    # Ethan sign-off 2026-08-29: opencode 1.18.25 pin needed before the 3-day age gate clears
+    - opencode-ai
+    - "@opencode-ai/sdk"

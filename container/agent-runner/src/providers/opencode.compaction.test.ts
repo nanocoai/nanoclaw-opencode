@@ -6,7 +6,7 @@ import { SqliteAgentMailbox } from '../mailbox/sqlite/index.js';
 import { buildPostCompactionReminder, createCompactionReminder } from './opencode.js';
 
 /**
- * OpenCode 1.18.21 has no compaction-prompt config API, but it DOES emit a
+ * OpenCode 1.18.25 has no compaction-prompt config API, but it DOES emit a
  * `session.compacted` event. The provider latches that event (filtered to the
  * turn's active session, since the OpenCode server is shared) and re-injects a
  * routing-discipline reminder on the next prompt — otherwise the auto-compacted

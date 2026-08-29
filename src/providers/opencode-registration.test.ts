@@ -20,6 +20,7 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect } from 'vitest';
 
+import { DATA_DIR } from '../config.js';
 import { getProviderContainerConfig, listProviderContainerConfigNames } from './provider-container-registry.js';
 import './index.js'; // the real host provider barrel — triggers each provider's self-registration
 
@@ -44,13 +45,19 @@ describe('opencode provider host registration', () => {
             contextLimit: 65536,
           },
         },
-        hostEnv: { OPENCODE_MODEL: 'openai/global-default' },
+        hostEnv: {
+          OPENCODE_MODEL: 'openai/global-default',
+          OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
+          OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
+        },
       });
       expect(contribution.env).toMatchObject({
         OPENCODE_MODEL: 'openai/selected-live-model',
         OPENCODE_PROVIDER: 'openai',
         ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
         OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
+        OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
+        OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
       });
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
@@ -90,6 +97,55 @@ describe('opencode provider host registration', () => {
       expect(contribution.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBeUndefined();
       expect(contribution.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
       expect(contribution.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('mounts the OneCLI-only ChatGPT auth stub at OpenCode native auth.json', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-chatgpt-registration-'));
+    const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
+    try {
+      fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+      fs.writeFileSync(stubPath, '{"openai":{"type":"oauth","access":"onecli-managed"}}');
+      const contribution = await getProviderContainerConfig('opencode')!({
+        sessionDir: path.join(root, 'session'),
+        agentGroupId: 'chatgpt-group',
+        groupDir: root,
+        selectedSkills: [],
+        model: 'openai/gpt-5.4',
+        providerSettings: { opencode: { modelProvider: 'openai', authMode: 'chatgpt' } },
+        hostEnv: { OPENCODE_AUTH_MODE: 'chatgpt' },
+      });
+      expect(contribution.mounts).toContainEqual({
+        hostPath: fs.realpathSync(stubPath),
+        containerPath: '/opencode-xdg/opencode/auth.json',
+        readonly: true,
+      });
+      expect(fs.statSync(path.join(root, 'session', 'opencode-xdg', 'opencode', 'auth.json')).isFile()).toBe(true);
+    } finally {
+      fs.rmSync(stubPath, { force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not apply the global ChatGPT login to an explicitly configured local endpoint', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-local-auth-registration-'));
+    try {
+      const contribution = await getProviderContainerConfig('opencode')!({
+        sessionDir: root,
+        agentGroupId: 'local-group',
+        groupDir: root,
+        selectedSkills: [],
+        model: 'openai/local-model',
+        providerSettings: {
+          opencode: { modelProvider: 'openai', baseUrl: 'http://host.docker.internal:8891/v1' },
+        },
+        hostEnv: { OPENCODE_AUTH_MODE: 'chatgpt' },
+      });
+      expect(contribution.mounts).not.toContainEqual(
+        expect.objectContaining({ containerPath: '/opencode-xdg/opencode/auth.json' }),
+      );
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

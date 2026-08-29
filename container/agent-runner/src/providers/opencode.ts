@@ -1,5 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from 'child_process';
-import { existsSync } from 'fs';
+import { lstatSync, realpathSync } from 'fs';
+import path from 'path';
 import { pathToFileURL } from 'url';
 
 import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@opencode-ai/sdk';
@@ -9,7 +10,14 @@ import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@
 import { createOpencodeClient as createOpencodeQuestionClient } from '@opencode-ai/sdk/v2';
 
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  PromptAttachment,
+  ProviderEvent,
+  ProviderOptions,
+  QueryInput,
+} from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { getAllDestinations } from '../destinations.js';
 
@@ -26,6 +34,8 @@ const MODEL_INPUT_MODALITIES = ['text', 'audio', 'image', 'video', 'pdf'] as con
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
 const AGENT_DIR = '/workspace/agent';
+const DEFAULT_NATIVE_ATTACHMENT_MAX_COUNT = 8;
+const DEFAULT_NATIVE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
 /** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
 const STALE_SESSION_RE =
@@ -114,27 +124,16 @@ function spawnOpencodeServer(
 }
 
 /**
- * One channel attachment, in structured form: a display name, a MIME type, a
- * path to the staged file inside the container, a remote URL — each present
- * only when the channel supplied it.
- *
- * Declared here rather than imported from `./types.js` because this file is
- * also installed onto agent-runners whose shared types carry no attachment
- * shape at all. Structural typing makes the two interchangeable wherever both
- * exist, so nothing is lost by keeping the declaration local, while an install
- * that predates the shared one still compiles.
+ * The shared attachment contract carries only host-staged files, bound to the
+ * source message whose inbox owns them. Remote URLs remain prompt text and are
+ * never fetched implicitly.
  *
  * Attachments are ALSO described inline in the prompt text the formatter
  * produces, and that text rendering stays the contract every provider relies
  * on. Everything below is an additive view for OpenCode's file parts: when no
  * structured attachment arrives, the provider behaves exactly as it did before.
  */
-export interface OpenCodePromptAttachment {
-  filename?: string;
-  mime?: string;
-  path?: string;
-  url?: string;
-}
+type OpenCodePromptAttachment = PromptAttachment;
 
 /** Extension → MIME fallback, for adapters that report no `mimeType`. */
 const ATTACHMENT_MIME_BY_EXT: Record<string, string> = {
@@ -152,6 +151,61 @@ function attachmentMime(att: OpenCodePromptAttachment): string | undefined {
   const name = att.path || att.filename || '';
   const dot = name.lastIndexOf('.');
   return dot < 0 ? undefined : ATTACHMENT_MIME_BY_EXT[name.slice(dot).toLowerCase()];
+}
+
+export interface NativeAttachmentLimits {
+  maxCount: number;
+  maxBytes: number;
+}
+
+export interface NativeAttachmentFileInfo {
+  realPath: string;
+  size: number;
+}
+
+function positiveIntegerEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    log(`Ignoring invalid ${name}: "${raw}"`);
+    return fallback;
+  }
+  return parsed;
+}
+
+export function resolveNativeAttachmentLimits(): NativeAttachmentLimits {
+  return {
+    maxCount: positiveIntegerEnv('OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT', DEFAULT_NATIVE_ATTACHMENT_MAX_COUNT),
+    maxBytes: positiveIntegerEnv('OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES', DEFAULT_NATIVE_ATTACHMENT_MAX_BYTES),
+  };
+}
+
+function inspectNativeAttachment(filePath: string): NativeAttachmentFileInfo | null {
+  try {
+    const stat = lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink()) return null;
+    return { realPath: realpathSync(filePath), size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+function isPathInside(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function isSafeComponent(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value !== '.' &&
+    value !== '..' &&
+    !value.includes('/') &&
+    !value.includes('\\') &&
+    !value.includes('\0')
+  );
 }
 
 /**
@@ -174,19 +228,45 @@ function attachmentMime(att: OpenCodePromptAttachment): string | undefined {
  */
 export function buildAttachmentFileParts(
   attachments: OpenCodePromptAttachment[] | undefined,
-  exists: (path: string) => boolean = existsSync,
+  inspect: (path: string) => NativeAttachmentFileInfo | null = inspectNativeAttachment,
+  limits: NativeAttachmentLimits = resolveNativeAttachmentLimits(),
 ): FilePartInput[] {
   const parts: FilePartInput[] = [];
+  let totalBytes = 0;
   for (const att of attachments ?? []) {
+    if (parts.length >= limits.maxCount) {
+      log(`Native attachment count limit reached (${limits.maxCount}); remaining files stay prompt text only`);
+      break;
+    }
+    if (!isSafeComponent(att.sourceMessageId) || !isSafeComponent(att.filename)) continue;
+    const expectedRoot = `/workspace/inbox/${att.sourceMessageId}`;
+    const expectedPath = `${expectedRoot}/${att.filename}`;
+    if (path.resolve(att.path) !== expectedPath) {
+      log(`Attachment path is not bound to its source message, not sent as media: ${att.filename}`);
+      continue;
+    }
     const mime = attachmentMime(att);
     if (!mime) continue;
     if (!mime.startsWith('image/') && mime !== 'application/pdf') continue;
-    if (!att.path || !exists(att.path)) {
-      const label = att.filename || att.path || att.url || 'unnamed';
-      log(`Attachment has no readable local file, not sent as media: ${label}`);
+    const info = inspect(att.path);
+    if (!info || !isPathInside(expectedRoot, info.realPath) || path.basename(info.realPath) !== att.filename) {
+      log(`Attachment has no safe regular file, not sent as media: ${att.filename}`);
       continue;
     }
-    parts.push({ type: 'file', mime, filename: att.filename, url: pathToFileURL(att.path).href });
+    if (info.size < 0 || totalBytes + info.size > limits.maxBytes) {
+      log(`Native attachment byte limit reached (${limits.maxBytes}); ${att.filename} stays prompt text only`);
+      continue;
+    }
+    totalBytes += info.size;
+    // OpenCode appends file parts after the combined batch text. Prefix the
+    // display name with the source id so two messages carrying `image.png`
+    // remain unambiguous to the model; the prompt text keeps the original name.
+    parts.push({
+      type: 'file',
+      mime,
+      filename: `${att.sourceMessageId}--${att.filename}`,
+      url: pathToFileURL(info.realPath).href,
+    });
   }
   return parts;
 }
@@ -201,9 +281,10 @@ export function buildAttachmentFileParts(
 export function buildPromptParts(
   text: string,
   attachments?: OpenCodePromptAttachment[],
-  exists: (path: string) => boolean = existsSync,
+  inspect: (path: string) => NativeAttachmentFileInfo | null = inspectNativeAttachment,
+  limits: NativeAttachmentLimits = resolveNativeAttachmentLimits(),
 ): Array<{ type: 'text'; text: string } | FilePartInput> {
-  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, exists)];
+  return [{ type: 'text', text }, ...buildAttachmentFileParts(attachments, inspect, limits)];
 }
 
 function wrapPromptWithContext(text: string, systemInstructions?: string): string {
@@ -494,7 +575,7 @@ export const QUESTION_STEERING_TEXT =
  * stop reaching anyone. Re-state it, with the live destination list, so the
  * next turn routes correctly.
  *
- * OpenCode 1.18.21 exposes no compaction-prompt/customInstructions config API,
+ * OpenCode 1.18.25 exposes no compaction-prompt/customInstructions config API,
  * so unlike the Claude provider's PreCompact hook we cannot steer the summary
  * itself. We re-inject on the next prompt instead. Destinations are read fresh
  * at injection time.

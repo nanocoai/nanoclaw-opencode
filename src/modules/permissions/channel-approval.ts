@@ -417,7 +417,7 @@ export async function buildAgentSelectionOptions(
  */
 export async function createNewAgentGroup(
   name: string,
-  opts?: { provider?: string; model?: string; instructions?: string },
+  opts?: { provider?: string; model?: string; instructions?: string; deliveryMode?: 'envelope' | 'tools-only' },
 ): Promise<AgentGroup> {
   let folder = toFolder(name);
   const baseFolder = folder;
@@ -448,10 +448,11 @@ export async function createNewAgentGroup(
     provider: opts?.provider,
     instructions: opts?.instructions,
   });
-  if (opts?.provider !== undefined || opts?.model !== undefined) {
+  if (opts?.provider !== undefined || opts?.model !== undefined || opts?.deliveryMode !== undefined) {
     await updateContainerConfigScalars(ag.id, {
       provider: opts.provider?.toLowerCase() === 'claude' ? null : opts.provider?.toLowerCase(),
       model: opts.model,
+      delivery_mode: opts.deliveryMode,
     });
   }
   return ag;

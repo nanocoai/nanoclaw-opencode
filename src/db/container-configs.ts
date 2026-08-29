@@ -10,6 +10,7 @@ const SCALAR_COLUMNS = new Set([
   'assistant_name',
   'max_messages_per_prompt',
   'cli_scope',
+  'delivery_mode',
   'timezone',
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
@@ -23,18 +24,20 @@ export async function getAllContainerConfigs(): Promise<ContainerConfigRow[]> {
 }
 
 /** Insert a new config row. Caller must supply all JSON fields (use defaults for empty). */
-export async function createContainerConfig(config: ContainerConfigRow): Promise<void> {
+export async function createContainerConfig(
+  config: Omit<ContainerConfigRow, 'delivery_mode'> & Partial<Pick<ContainerConfigRow, 'delivery_mode'>>,
+): Promise<void> {
   await getDb().run(
     `INSERT INTO container_configs (
         agent_group_id, provider, model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
-        additional_mounts, cli_scope, timezone, updated_at
+        additional_mounts, cli_scope, delivery_mode, timezone, updated_at
       ) VALUES (
         @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
-        @additional_mounts, @cli_scope, @timezone, @updated_at
+        @additional_mounts, @cli_scope, @delivery_mode, @timezone, @updated_at
       )`,
-    config,
+    { ...config, delivery_mode: config.delivery_mode ?? null },
   );
 }
 
@@ -85,6 +88,7 @@ export async function updateContainerConfigScalars(
       | 'assistant_name'
       | 'max_messages_per_prompt'
       | 'cli_scope'
+      | 'delivery_mode'
       | 'timezone'
     >
   >,

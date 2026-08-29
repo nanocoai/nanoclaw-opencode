@@ -16,6 +16,14 @@ Re-running the install refreshes every skill-owned file and pin.
 ```nc:copy
 payload/src/providers/opencode.ts -> src/providers/opencode.ts
 payload/src/providers/opencode-registration.test.ts -> src/providers/opencode-registration.test.ts
+payload/src/modules/opencode-channel-provisioning/index.ts -> src/modules/opencode-channel-provisioning/index.ts
+payload/src/modules/opencode-channel-provisioning/types.ts -> src/modules/opencode-channel-provisioning/types.ts
+payload/src/modules/opencode-channel-provisioning/db.ts -> src/modules/opencode-channel-provisioning/db.ts
+payload/src/modules/opencode-channel-provisioning/migration.ts -> src/modules/opencode-channel-provisioning/migration.ts
+payload/src/modules/opencode-channel-provisioning/model-discovery.ts -> src/modules/opencode-channel-provisioning/model-discovery.ts
+payload/src/modules/opencode-channel-provisioning/cli-resource.ts -> src/modules/opencode-channel-provisioning/cli-resource.ts
+payload/src/modules/opencode-channel-provisioning/model-discovery.test.ts -> src/modules/opencode-channel-provisioning/model-discovery.test.ts
+payload/src/modules/opencode-channel-provisioning/provisioning.test.ts -> src/modules/opencode-channel-provisioning/provisioning.test.ts
 payload/container/agent-runner/src/providers/mcp-to-opencode.ts -> container/agent-runner/src/providers/mcp-to-opencode.ts
 payload/container/agent-runner/src/providers/mcp-to-opencode.test.ts -> container/agent-runner/src/providers/mcp-to-opencode.test.ts
 payload/container/agent-runner/src/providers/opencode.ts -> container/agent-runner/src/providers/opencode.ts
@@ -41,6 +49,10 @@ payload/opencode-cli-tools.test.ts -> src/opencode-cli-tools.test.ts
 import './opencode.js';
 ```
 
+```nc:append to:src/modules/index.ts
+import './opencode-channel-provisioning/index.js';
+```
+
 ```nc:append to:container/agent-runner/src/providers/index.ts
 import './opencode.js';
 ```
@@ -55,11 +67,11 @@ The CLI and SDK are one tested pair. OpenCode's package requires its trusted
 postinstall so the platform binary is present in the image.
 
 ```nc:dep manager:bun cwd:container/agent-runner
-@opencode-ai/sdk@1.18.21
+@opencode-ai/sdk@1.18.25
 ```
 
 ```nc:json-merge into:container/cli-tools.json key:name
-{ "name": "opencode-ai", "version": "1.18.21", "onlyBuilt": true }
+{ "name": "opencode-ai", "version": "1.18.25", "onlyBuilt": true }
 ```
 
 ### 4. Build and validate
@@ -70,7 +82,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/providers/opencode-registration.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
+pnpm exec vitest run src/providers/opencode-registration.test.ts src/modules/opencode-channel-provisioning/model-discovery.test.ts src/modules/opencode-channel-provisioning/provisioning.test.ts src/opencode-cli-tools.test.ts setup/providers/opencode.test.ts setup/providers/opencode-registration.test.ts
 cd container/agent-runner && bun test src/providers/opencode-registration.test.ts src/providers/opencode.config.test.ts src/providers/opencode.empty-resume.test.ts src/providers/opencode.memory.test.ts
 ```
 
@@ -84,9 +96,19 @@ cd container/agent-runner && bun test src/providers/opencode-registration.test.t
 pnpm exec tsx setup/index.ts --step provider-auth opencode
 ```
 
-The setup module offers local/self-hosted OpenAI-compatible endpoints,
-OpenRouter, DeepSeek, and a custom provider. API keys are stored in OneCLI;
-`.env` contains only provider, model, and optional base-URL configuration.
+The setup module offers ChatGPT Plus/Pro through OpenCode's native browser or
+device-pairing flow, local/self-hosted OpenAI-compatible endpoints, OpenRouter,
+DeepSeek, and a custom provider. ChatGPT login runs in the pinned agent image
+with an isolated temporary XDG directory. The live OAuth record is translated
+into the `tokens.{access_token,refresh_token,account_id}` shape OneCLI classifies
+as OAuth (OpenCode's own `openai.{access,refresh,accountId}` layout would be
+ingested as an opaque API key and never refreshed), moved into OneCLI, and the
+temporary directory is deleted. The runtime sees only a read-only
+`onecli-managed` stub. API keys are likewise stored in OneCLI;
+`.env` contains only provider, model, auth-mode, and optional base-URL configuration.
+On the next host start, the OpenCode module mirrors that non-secret backend
+configuration into an `Environment default` model-provider connection. Extra
+connections can be managed with `ncl opencode-model-providers`.
 
 ## Use it
 
@@ -98,19 +120,53 @@ ncl groups restart --id <group-id>
 Every provider reads the same group memory tree, so switching providers does
 not require a memory migration. `/migrate-memory` is only for legacy formats.
 
+When an unknown channel chooses **Connect new agent** and OpenCode is the
+instance default, the shared channel flow delegates to this skill. It asks for
+the name, then offers configured connections and common recommended providers
+first. The complete paginated live OpenCode provider catalog remains available
+behind **More providers…**, with optional search, alongside an inline local/custom endpoint path. It discovers models
+live and presents them as a paginated list; model search is an optional fallback,
+not a required step. It requires explicit confirmation, then stores the chosen
+model and provider settings on that new group before the first container starts. Catalog providers
+expect their credentials to be available through OneCLI; secrets never enter
+the wizard state. The durable wizard row survives host restarts and works
+through every channel adapter using the generic approval flow.
+
 OpenCode runs in `/workspace/agent`, explicitly reads the composed
 `CLAUDE.md`, and keeps its SDK client scoped to that same directory. Session
 state is isolated per NanoClaw session under `opencode-xdg`.
 
-Attachments remain prompt text unless NanoClaw supplies structured attachment
-parts. Provider-side image/PDF handling is present and tested, but this skill
-does not claim missing core plumbing exists.
+Host-staged image/PDF attachments travel through NanoClaw's message-bound
+provider seam on both opening prompts and follow-up pushes. OpenCode rechecks
+that each file is a regular file inside the source message's inbox before
+creating a native file part. Native media defaults to at most 8 files and 25
+MiB total per prompt; `OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT` and
+`OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES` override those positive-integer limits.
+Rejected, remote-only, or unsupported attachments remain described in prompt
+text and are never fetched implicitly.
 
 ## Troubleshooting
 
 - `Unknown provider: opencode`: re-run this skill; a barrel import is missing.
 - `spawn opencode ENOENT`: rebuild the image after applying the skill.
 - Custom endpoint fails after the first turn: include `/v1` and use provider `openai`.
-- Version mismatch: reapply the skill so CLI and SDK both return to 1.18.21.
+- Version mismatch: reapply the skill so CLI and SDK both return to 1.18.25.
+
+## Provider-contract compatibility
+
+NanoClaw PRs
+[#3581](https://github.com/nanocoai/nanoclaw/pull/3581) and
+[#3584](https://github.com/nanocoai/nanoclaw/pull/3584) introduce declarative
+host, setup, and runtime provider contracts. Their direction matches this
+skill-first provider, but the OpenCode implementation in #3584 predates this
+payload's setup authentication and per-group ChatGPT mode.
+
+When adopting those contracts, declare OpenCode setup authentication and its
+install check as provider-owned instead of waived. Preserve the channel
+provisioning module, restart-safe wizard state, live model discovery, and
+per-group provider/model settings; those are additional behavior rather than
+replacements for the contract. The conditional read-only OneCLI credential
+stub currently remains in the legacy host adapter until the declarative host
+contract can represent a group-selected, gateway-owned credential file.
 
 To uninstall the provider, follow [REMOVE.md](REMOVE.md).

@@ -235,6 +235,8 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+export type DeliveryMode = 'envelope' | 'tools-only';
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -251,6 +253,7 @@ export interface ContainerConfig {
   providerSettings?: unknown;
   effort?: string;
   timezone?: string;
+  deliveryMode?: DeliveryMode;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
   runtimeTier?: 'container' | 'vm';
 }
@@ -373,6 +376,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     providerSettings: row.provider_settings ? JSON.parse(row.provider_settings) : undefined,
     effort: row.effort ?? undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
+    deliveryMode: row.delivery_mode === 'tools-only' ? 'tools-only' : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
   };
 }

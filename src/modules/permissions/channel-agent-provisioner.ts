@@ -2,6 +2,7 @@ import type { RawOption } from '../../channels/ask-question.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { ResponsePayload } from '../../response-registry.js';
 import type { AgentGroup } from '../../types.js';
+import type { DeliveryMode } from '../../container-config.js';
 import type { PendingChannelApproval } from './db/pending-channel-approvals.js';
 
 export interface ProvisionedAgentInput {
@@ -9,10 +10,12 @@ export interface ProvisionedAgentInput {
   provider: string;
   model: string;
   instructions?: string;
+  deliveryMode?: DeliveryMode;
 }
 
 export interface ChannelAgentProvisioningContext {
   row: PendingChannelApproval;
+  isApproverDm(event: InboundEvent): Promise<boolean>;
   deliverQuestion(title: string, question: string, options: RawOption[]): Promise<boolean>;
   deliverText(text: string): Promise<void>;
   createAgent(input: ProvisionedAgentInput): Promise<AgentGroup>;

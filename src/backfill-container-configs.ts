@@ -65,6 +65,7 @@ export async function backfillContainerConfigs(): Promise<void> {
       packages_npm: JSON.stringify(legacy.packages?.npm ?? []),
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),
       cli_scope: 'group',
+      delivery_mode: null,
       timezone: null,
       updated_at: new Date().toISOString(),
     };

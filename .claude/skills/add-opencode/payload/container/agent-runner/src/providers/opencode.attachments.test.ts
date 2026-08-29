@@ -1,145 +1,129 @@
-import { describe, it, expect } from 'bun:test';
+import { afterEach, describe, expect, it } from 'bun:test';
 
-import { buildAttachmentFileParts, buildPromptParts } from './opencode.js';
+import {
+  buildAttachmentFileParts,
+  buildPromptParts,
+  resolveNativeAttachmentLimits,
+  type NativeAttachmentFileInfo,
+  type NativeAttachmentLimits,
+} from './opencode.js';
 
-/**
- * Channel attachments reach providers as prompt text (the formatter renders a
- * line describing each one). That stays, but text alone means a photo never
- * actually reaches a multimodal model. These cover the provider half of the
- * structured seam: the OpenCode file parts built from an attachment, on the
- * opening prompt and on every follow-up push.
- *
- * The `file://` URL form is load-bearing — OpenCode reads the path server-side
- * and inlines it as base64 itself (see buildAttachmentFileParts).
- *
- * Attachments are constructed inline here rather than produced upstream: the
- * provider takes the shape structurally, so what these pin down is its own
- * consumption, independent of whoever assembled the attachment.
- */
-
-const PRESENT = new Set([
-  '/workspace/inbox/msg-1/cat.png',
-  '/workspace/inbox/msg-1/report.pdf',
-  '/workspace/inbox/msg-1/blob',
+const PRESENT = new Map<string, number>([
+  ['/workspace/inbox/msg-1/cat.png', 1_024],
+  ['/workspace/inbox/msg-1/report.pdf', 2_048],
+  ['/workspace/inbox/msg-1/blob', 128],
+  ['/workspace/inbox/msg-1/second.png', 3_072],
 ]);
-const exists = (p: string): boolean => PRESENT.has(p);
+const inspect = (filePath: string): NativeAttachmentFileInfo | null => {
+  const size = PRESENT.get(filePath);
+  return size === undefined ? null : { realPath: filePath, size };
+};
+const generous: NativeAttachmentLimits = { maxCount: 8, maxBytes: 25 * 1024 * 1024 };
+
+function attachment(filename: string, mime: string | undefined, sourceMessageId = 'msg-1') {
+  return {
+    sourceMessageId,
+    filename,
+    ...(mime ? { mime } : {}),
+    path: `/workspace/inbox/${sourceMessageId}/${filename}`,
+  };
+}
+
+afterEach(() => {
+  delete process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT;
+  delete process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES;
+});
 
 describe('buildAttachmentFileParts', () => {
-  it('sends an image as a file part with its mime and a file:// url', () => {
-    const parts = buildAttachmentFileParts(
-      [{ filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/msg-1/cat.png' }],
-      exists,
-    );
-    expect(parts).toEqual([
+  it('sends a message-bound image as a file part', () => {
+    expect(buildAttachmentFileParts([attachment('cat.png', 'image/png')], inspect, generous)).toEqual([
       {
         type: 'file',
         mime: 'image/png',
-        filename: 'cat.png',
+        filename: 'msg-1--cat.png',
         url: 'file:///workspace/inbox/msg-1/cat.png',
       },
     ]);
   });
 
-  it('sends a PDF too — the backend may reject it, withholding it silently is worse', () => {
+  it('sends a PDF and falls back to a recognized extension', () => {
     const parts = buildAttachmentFileParts(
-      [{ filename: 'report.pdf', mime: 'application/pdf', path: '/workspace/inbox/msg-1/report.pdf' }],
-      exists,
+      [attachment('report.pdf', 'application/pdf'), attachment('cat.png', undefined)],
+      inspect,
+      generous,
     );
-    expect(parts).toHaveLength(1);
-    expect(parts[0].mime).toBe('application/pdf');
-    expect(parts[0].url).toBe('file:///workspace/inbox/msg-1/report.pdf');
+    expect(parts.map((part) => part.mime)).toEqual(['application/pdf', 'image/png']);
   });
 
-  it('falls back to the file extension when the adapter reported no mime', () => {
-    const parts = buildAttachmentFileParts([{ filename: 'cat.PNG', path: '/workspace/inbox/msg-1/cat.png' }], exists);
-    expect(parts).toHaveLength(1);
-    expect(parts[0].mime).toBe('image/png');
+  it('rejects a path outside the source message inbox even when it exists', () => {
+    const forged = {
+      sourceMessageId: 'msg-1',
+      filename: 'cat.png',
+      mime: 'image/png',
+      path: '/workspace/agent/cat.png',
+    };
+    const forgedInspect = (): NativeAttachmentFileInfo => ({ realPath: '/workspace/agent/cat.png', size: 10 });
+    expect(buildAttachmentFileParts([forged], forgedInspect, generous)).toEqual([]);
   });
 
-  it('adds nothing when there are no attachments, so parts stay text-only', () => {
-    expect(buildAttachmentFileParts(undefined, exists)).toEqual([]);
-    expect(buildAttachmentFileParts([], exists)).toEqual([]);
-    // What the query generator actually spreads into the prompt body.
-    expect([{ type: 'text', text: 'hi' }, ...buildAttachmentFileParts(undefined, exists)]).toEqual([
-      { type: 'text', text: 'hi' },
-    ]);
+  it('rejects a symlink/escape reported by filesystem inspection', () => {
+    const escapedInspect = (): NativeAttachmentFileInfo => ({ realPath: '/workspace/agent/private.pdf', size: 10 });
+    expect(buildAttachmentFileParts([attachment('report.pdf', 'application/pdf')], escapedInspect, generous)).toEqual(
+      [],
+    );
   });
 
-  it('skips an attachment with no resolvable local file instead of throwing', () => {
-    expect(() =>
-      buildAttachmentFileParts(
-        [
-          { filename: 'gone.png', mime: 'image/png', path: '/workspace/inbox/msg-9/gone.png' },
-          { filename: 'linked.png', mime: 'image/png', url: 'https://example.test/linked.png' },
-        ],
-        exists,
-      ),
-    ).not.toThrow();
+  it('skips missing and non-media files', () => {
     expect(
       buildAttachmentFileParts(
         [
-          { filename: 'gone.png', mime: 'image/png', path: '/workspace/inbox/msg-9/gone.png' },
-          { filename: 'linked.png', mime: 'image/png', url: 'https://example.test/linked.png' },
+          attachment('gone.png', 'image/png', 'msg-9'),
+          attachment('cat.png', 'text/plain'),
+          attachment('blob', undefined),
         ],
-        exists,
+        inspect,
+        generous,
       ),
     ).toEqual([]);
   });
 
-  it('skips non-media attachments — the prompt text still describes them', () => {
-    const parts = buildAttachmentFileParts(
-      [
-        { filename: 'notes.txt', mime: 'text/plain', path: '/workspace/inbox/msg-1/cat.png' },
-        { filename: 'voice.ogg', mime: 'audio/ogg', path: '/workspace/inbox/msg-1/cat.png' },
-        { filename: 'no-extension', path: '/workspace/inbox/msg-1/blob' },
-      ],
-      exists,
-    );
-    expect(parts).toEqual([]);
+  it('enforces count and actual total-byte limits', () => {
+    const files = [attachment('cat.png', 'image/png'), attachment('second.png', 'image/png')];
+    expect(buildAttachmentFileParts(files, inspect, { maxCount: 1, maxBytes: 10_000 })).toHaveLength(1);
+    expect(buildAttachmentFileParts(files, inspect, { maxCount: 8, maxBytes: 3_000 })).toHaveLength(1);
+    expect(buildAttachmentFileParts(files, inspect, { maxCount: 8, maxBytes: 500 })).toEqual([]);
+  });
+
+  it('uses safe defaults and accepts positive environment overrides', () => {
+    expect(resolveNativeAttachmentLimits()).toEqual({ maxCount: 8, maxBytes: 25 * 1024 * 1024 });
+    process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT = '3';
+    process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES = '4096';
+    expect(resolveNativeAttachmentLimits()).toEqual({ maxCount: 3, maxBytes: 4096 });
+  });
+
+  it('ignores invalid environment overrides', () => {
+    process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT = '0';
+    process.env.OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES = '25mb';
+    expect(resolveNativeAttachmentLimits()).toEqual({ maxCount: 8, maxBytes: 25 * 1024 * 1024 });
   });
 });
 
-/**
- * OpenCode keeps ONE query open per session, so after the first turn nearly
- * every real message arrives through AgentQuery.push rather than query(). The
- * prompt body for a push is built the same way as the opening one — otherwise
- * a photo sent as the second message reaches the model as prose only, and the
- * model confabulates a description of a picture it never saw (observed live).
- */
 describe('buildPromptParts', () => {
-  it('carries an image on a follow-up push, not just the opening query', () => {
-    const parts = buildPromptParts(
-      'what is in this photo?',
-      [{ filename: 'cat.png', mime: 'image/png', path: '/workspace/inbox/msg-1/cat.png' }],
-      exists,
-    );
-    expect(parts).toEqual([
-      { type: 'text', text: 'what is in this photo?' },
+  it('carries native media on opening and follow-up prompt construction', () => {
+    expect(buildPromptParts('what is this?', [attachment('cat.png', 'image/png')], inspect, generous)).toEqual([
+      { type: 'text', text: 'what is this?' },
       {
         type: 'file',
         mime: 'image/png',
-        filename: 'cat.png',
+        filename: 'msg-1--cat.png',
         url: 'file:///workspace/inbox/msg-1/cat.png',
       },
     ]);
   });
 
-  it('stays text-only when the push has no attachments', () => {
-    expect(buildPromptParts('just words', undefined, exists)).toEqual([{ type: 'text', text: 'just words' }]);
-    expect(buildPromptParts('just words', [], exists)).toEqual([{ type: 'text', text: 'just words' }]);
-  });
-
-  it('keeps the text part first and skips media it cannot resolve', () => {
-    const parts = buildPromptParts(
-      'two files',
-      [
-        { filename: 'gone.png', mime: 'image/png', path: '/workspace/inbox/msg-9/gone.png' },
-        { filename: 'report.pdf', mime: 'application/pdf', path: '/workspace/inbox/msg-1/report.pdf' },
-      ],
-      exists,
-    );
-    expect(parts).toHaveLength(2);
-    expect(parts[0]).toEqual({ type: 'text', text: 'two files' });
-    expect(parts[1]).toMatchObject({ type: 'file', mime: 'application/pdf' });
+  it('stays text-only when there are no accepted attachments', () => {
+    expect(buildPromptParts('just words', undefined, inspect, generous)).toEqual([
+      { type: 'text', text: 'just words' },
+    ]);
   });
 });
