@@ -149,6 +149,73 @@ export function buildOpenCodeLoginArgs(loginDir: string, method: ChatGptLoginMet
   ];
 }
 
+/**
+ * The container-side `auth.json` when no live OpenCode credential is at hand.
+ *
+ * Carries no account id on purpose. The pinned OpenCode CLI sets the
+ * `ChatGPT-Account-Id` header only when `openai.accountId` is present, and
+ * OneCLI sets that header itself from the vaulted `tokens.account_id` — the
+ * vault is the single source of truth for routing. A sign-in-free path
+ * therefore has nothing to source and nothing to guess: it emits sentinels
+ * only, and never has to read `auth.json` or a vaulted secret value.
+ */
+export function buildOneCliManagedStub(): Record<string, unknown> {
+  return {
+    openai: {
+      type: 'oauth',
+      access: ONECLI_SENTINEL,
+      refresh: ONECLI_SENTINEL,
+      expires: STUB_EXPIRES_AT,
+    },
+  };
+}
+
+/** A stub is usable when OpenCode can parse it as an OpenAI OAuth record. */
+export function isUsableChatGptStub(contents: string): boolean {
+  try {
+    const openai = (JSON.parse(contents) as Record<string, unknown>)?.openai as Record<string, unknown> | undefined;
+    return (
+      !!openai &&
+      typeof openai === 'object' &&
+      openai.type === 'oauth' &&
+      typeof openai.access === 'string' &&
+      typeof openai.refresh === 'string'
+    );
+  } catch {
+    return false;
+  }
+}
+
+function chatGptStubPath(root: string): string {
+  return path.join(root, OPENCODE_CHATGPT_STUB);
+}
+
+function writeChatGptStub(stub: Record<string, unknown>, root: string): void {
+  const stubPath = chatGptStubPath(root);
+  fs.mkdirSync(path.dirname(stubPath), { recursive: true });
+  fs.writeFileSync(stubPath, `${JSON.stringify(stub, null, 2)}\n`, { mode: 0o600 });
+  fs.chmodSync(stubPath, 0o600);
+}
+
+/**
+ * Make sure the container credential stub exists, independently of sign-in.
+ *
+ * `src/providers/opencode.ts` refuses to spawn a ChatGPT group without this
+ * file, so a machine whose vault already holds the secret must still be able
+ * to produce it — otherwise setup skips sign-in, writes nothing, and every
+ * spawn loops on "credential stub is missing; re-run setup".
+ */
+export function ensureChatGptStub(root: string = process.cwd()): 'present' | 'written' {
+  const stubPath = chatGptStubPath(root);
+  try {
+    if (fs.existsSync(stubPath) && isUsableChatGptStub(fs.readFileSync(stubPath, 'utf8'))) return 'present';
+  } catch {
+    // unreadable — rewrite it below
+  }
+  writeChatGptStub(buildOneCliManagedStub(), root);
+  return 'written';
+}
+
 /** Replace live OpenCode OAuth tokens with OneCLI sentinels while retaining routing metadata. */
 export function buildOpenCodeOAuthStub(authJson: unknown): Record<string, unknown> {
   if (!authJson || typeof authJson !== 'object') throw new Error('OpenCode auth.json is not an object');
@@ -259,11 +326,35 @@ function chatGptSecretExists(): boolean {
   }
 }
 
-export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promise<void> {
-  if (chatGptSecretExists()) {
-    p.log.info(brandBody('ChatGPT is already connected (OneCLI secret exists) — skipping sign-in.'));
+export interface ChatGptAuthDeps {
+  /** Vault probe; injected in tests so no real `onecli` process is spawned. */
+  secretExists?: () => boolean;
+  /** Interactive sign-in; injected in tests to assert it is never reached. */
+  signIn?: (method: ChatGptLoginMethod, root: string) => Promise<void>;
+  /** Install root the stub is written under. */
+  root?: string;
+}
+
+export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod, deps: ChatGptAuthDeps = {}): Promise<void> {
+  const root = deps.root ?? process.cwd();
+  const secretExists = deps.secretExists ?? chatGptSecretExists;
+  if (secretExists()) {
+    // Sign-in is skippable; the stub is not. It lives outside the vault, so a
+    // present secret says nothing about whether this machine has one.
+    const stub = ensureChatGptStub(root);
+    p.log.info(
+      brandBody(
+        stub === 'written'
+          ? 'ChatGPT is already connected (OneCLI secret exists) — skipped sign-in and rebuilt the container credential stub.'
+          : 'ChatGPT is already connected (OneCLI secret exists) — skipping sign-in.',
+      ),
+    );
     return;
   }
+  await (deps.signIn ?? performChatGptSignIn)(method, root);
+}
+
+async function performChatGptSignIn(method: ChatGptLoginMethod, root: string): Promise<void> {
   const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
   const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
 
@@ -309,10 +400,7 @@ export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod): Promis
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
-    const stubPath = path.join(process.cwd(), OPENCODE_CHATGPT_STUB);
-    fs.mkdirSync(path.dirname(stubPath), { recursive: true });
-    fs.writeFileSync(stubPath, `${JSON.stringify(stub, null, 2)}\n`, { mode: 0o600 });
-    fs.chmodSync(stubPath, 0o600);
+    writeChatGptStub(stub, root);
   } finally {
     removeVaultFile();
     removeLoginDir();

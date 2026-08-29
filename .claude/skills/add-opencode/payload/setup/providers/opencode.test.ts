@@ -1,18 +1,33 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  buildOneCliManagedStub,
   buildOneCliOAuthSecret,
   buildOpenCodeLoginArgs,
   buildOpenCodeOAuthStub,
   discoverLocalModelIds,
+  ensureChatGptStub,
+  isUsableChatGptStub,
   normalizeOptionalInput,
   OPENCODE_CHATGPT_MODELS,
   parseChatGptModelList,
   hasChatGptSecret,
+  runOpenCodeChatGptAuth,
 } from './opencode.js';
+
+const proc = vi.hoisted(() => ({ execFileSync: vi.fn(), spawn: vi.fn() }));
+vi.mock('child_process', async (importActual) => {
+  const actual = await importActual<typeof import('child_process')>();
+  return {
+    ...actual,
+    execFileSync: (...args: unknown[]) => proc.execFileSync(...args),
+    spawn: (...args: unknown[]) => proc.spawn(...args),
+  };
+});
 
 describe('OpenCode setup payload', () => {
   it('accepts a blank optional API key for a keyless local endpoint', () => {
@@ -165,5 +180,108 @@ describe('hasChatGptSecret', () => {
   it('is false for other secrets or bad output', () => {
     expect(hasChatGptSecret(JSON.stringify({ data: [{ name: 'Anthropic' }] }))).toBe(false);
     expect(hasChatGptSecret('not json')).toBe(false);
+  });
+});
+
+describe('ChatGPT credential stub idempotency', () => {
+  const roots: string[] = [];
+  const makeRoot = (): string => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-stub-test-'));
+    roots.push(root);
+    return root;
+  };
+  const stubIn = (root: string): string => path.join(root, 'data', 'opencode', 'openai-auth-stub.json');
+
+  afterEach(() => {
+    while (roots.length) fs.rmSync(roots.pop() as string, { recursive: true, force: true });
+    proc.execFileSync.mockReset();
+    proc.spawn.mockReset();
+  });
+
+  // Black-box reproduction of the spawn loop: the only inputs are a vault that
+  // already holds "OpenCode ChatGPT" and an install with no stub on disk.
+  it('reproduces the loop: a vaulted secret with no stub still leaves a stub behind', async () => {
+    const root = makeRoot();
+    proc.execFileSync.mockReturnValue(JSON.stringify({ data: [{ name: 'OpenCode ChatGPT' }] }));
+
+    await runOpenCodeChatGptAuth('device', { root });
+
+    // Before the fix this file was never written, so `src/providers/opencode.ts`
+    // threw "credential stub is missing; re-run setup" on every spawn — and
+    // re-running setup skipped sign-in again, forever.
+    expect(fs.existsSync(stubIn(root))).toBe(true);
+    expect(isUsableChatGptStub(fs.readFileSync(stubIn(root), 'utf8'))).toBe(true);
+    // No container sign-in was launched: the secret was already there.
+    expect(proc.spawn).not.toHaveBeenCalled();
+    expect(proc.execFileSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('writes the stub when the vault secret exists but the stub does not, without signing in', async () => {
+    const root = makeRoot();
+    const signIn = vi.fn(async () => {});
+
+    await runOpenCodeChatGptAuth('device', { root, secretExists: () => true, signIn });
+
+    expect(signIn).not.toHaveBeenCalled();
+    const contents = fs.readFileSync(stubIn(root), 'utf8');
+    expect(JSON.parse(contents)).toEqual({
+      openai: { type: 'oauth', access: 'onecli-managed', refresh: 'onecli-managed', expires: Date.UTC(2100, 0, 1) },
+    });
+    // The host provider mounts this file read-only into the container; once it
+    // exists, spawn stops throwing "credential stub is missing; re-run setup".
+    expect(isUsableChatGptStub(contents)).toBe(true);
+  });
+
+  it('leaves an existing stub alone so a real accountId survives re-runs of setup', async () => {
+    const root = makeRoot();
+    const existing = {
+      openai: {
+        type: 'oauth',
+        access: 'onecli-managed',
+        refresh: 'onecli-managed',
+        expires: Date.UTC(2100, 0, 1),
+        accountId: 'account-123',
+      },
+    };
+    fs.mkdirSync(path.dirname(stubIn(root)), { recursive: true });
+    fs.writeFileSync(stubIn(root), `${JSON.stringify(existing, null, 2)}\n`);
+
+    await runOpenCodeChatGptAuth('device', { root, secretExists: () => true, signIn: async () => {} });
+
+    expect(JSON.parse(fs.readFileSync(stubIn(root), 'utf8'))).toEqual(existing);
+  });
+
+  it('rebuilds a corrupt stub instead of leaving the container unspawnable', () => {
+    const root = makeRoot();
+    fs.mkdirSync(path.dirname(stubIn(root)), { recursive: true });
+    fs.writeFileSync(stubIn(root), '{ truncated');
+
+    expect(ensureChatGptStub(root)).toBe('written');
+    expect(isUsableChatGptStub(fs.readFileSync(stubIn(root), 'utf8'))).toBe(true);
+    expect(ensureChatGptStub(root)).toBe('present');
+  });
+
+  it('still runs sign-in when no vault secret exists', async () => {
+    const root = makeRoot();
+    const signIn = vi.fn(async () => {});
+
+    await runOpenCodeChatGptAuth('browser', { root, secretExists: () => false, signIn });
+
+    expect(signIn).toHaveBeenCalledWith('browser', root);
+    expect(fs.existsSync(stubIn(root))).toBe(false);
+  });
+
+  it('omits accountId, leaving OneCLI the sole source of chatgpt-account-id', () => {
+    // The pinned OpenCode CLI sets `ChatGPT-Account-Id` only when
+    // `openai.accountId` is present; OneCLI injects it from the vaulted
+    // `tokens.account_id`, so a sign-in-free stub needs no account id and
+    // never has to read a secret value to invent one.
+    expect(buildOneCliManagedStub().openai).not.toHaveProperty('accountId');
+  });
+
+  it('rejects stub contents OpenCode cannot use as an OAuth record', () => {
+    expect(isUsableChatGptStub('not json')).toBe(false);
+    expect(isUsableChatGptStub(JSON.stringify({ openai: { type: 'api', key: 'sk-live' } }))).toBe(false);
+    expect(isUsableChatGptStub(JSON.stringify({}))).toBe(false);
   });
 });
