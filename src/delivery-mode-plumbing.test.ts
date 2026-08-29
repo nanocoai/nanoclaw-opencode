@@ -43,10 +43,9 @@ describe('delivery mode host plumbing', () => {
 
   it('allows the host CLI to select the mode but denies a group-scoped agent changing it', async () => {
     const command = lookup('groups-config-update')!;
-    const handlerResult = (await command.handler(
-      { id: group.id, 'delivery-mode': 'tools-only' },
-      { caller: 'host' } as never,
-    )) as Record<string, unknown>;
+    const handlerResult = (await command.handler({ id: group.id, 'delivery-mode': 'tools-only' }, {
+      caller: 'host',
+    } as never)) as Record<string, unknown>;
     expect(handlerResult.delivery_mode).toBe('tools-only');
 
     const decision = await commandGuardSpec(command).decide({
