@@ -24,7 +24,8 @@ import { migration020 } from './020-container-config-timezone.js';
 import { migration021 } from './021-approval-question.js';
 import { migration022 } from './022-messaging-group-detached.js';
 import { migration023 } from './023-approvals-instance.js';
-import { migration024 } from './024-delivery-mode.js';
+import { migration024 as migration024DeliveryMode } from './024-delivery-mode.js';
+import { migration024 as migration024HostCoordination } from './024-host-coordination.js';
 
 interface MigrationBase {
   version: number;
@@ -90,7 +91,8 @@ export const migrations: Migration[] = [
   migration021,
   migration022,
   migration023,
-  migration024,
+  migration024DeliveryMode,
+  migration024HostCoordination,
 ];
 
 /**

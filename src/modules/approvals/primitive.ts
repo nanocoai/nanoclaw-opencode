@@ -25,7 +25,7 @@ import { normalizeOptions, type RawOption } from '../../channels/ask-question.js
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { createPendingApproval, deletePendingApproval, getSession } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
-import { wakeContainer } from '../../container-runner.js';
+import { requestWake } from '../../request-wake.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
@@ -202,7 +202,7 @@ export async function notifyAgent(session: Session, text: string): Promise<void>
     content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
   });
   const fresh = await getSession(session.id);
-  if (fresh) await wakeContainer(fresh);
+  if (fresh) await requestWake(fresh, 'inbound-message');
 }
 
 export interface RequestApprovalOptions {
@@ -259,7 +259,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     title,
     question,
     options_json: JSON.stringify(normalizedOptions),
-    approver_user_id: approverUserId ?? null,
+    // The DM'd approver is the identity this card was routed to; recording it
+    // makes resolution exact — only that user may decide the row.
+    approver_user_id: approverUserId ?? target.userId ?? null,
   });
 
   const adapter = getDeliveryAdapter();

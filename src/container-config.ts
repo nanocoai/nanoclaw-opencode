@@ -11,7 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { GROUPS_DIR, TIMEZONE } from './config.js';
+import { DEFAULT_MODEL, FAST_MODE, GROUPS_DIR, TIMEZONE } from './config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { isValidTimezone } from './timezone.js';
@@ -252,6 +252,8 @@ export interface ContainerConfig {
   model?: string;
   providerSettings?: unknown;
   effort?: string;
+  /** API fast serving tier for this container; absent = the provider default. */
+  fastMode?: boolean;
   timezone?: string;
   deliveryMode?: DeliveryMode;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
@@ -372,9 +374,12 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     assistantName: row.assistant_name ?? group.name,
     agentGroupId: group.id,
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
-    model: row.model ?? undefined,
+    // The group's own model wins; NANOCLAW_DEFAULT_MODEL fills in for groups
+    // that have none. Both absent leaves the field out and the SDK decides.
+    model: row.model ?? (DEFAULT_MODEL || undefined),
     providerSettings: row.provider_settings ? JSON.parse(row.provider_settings) : undefined,
     effort: row.effort ?? undefined,
+    fastMode: FAST_MODE || undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
     deliveryMode: row.delivery_mode === 'tools-only' ? 'tools-only' : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
