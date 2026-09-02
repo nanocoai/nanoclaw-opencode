@@ -45,7 +45,18 @@ export const LINK_ACTION_SCHEMA = Object.freeze({
   description: 'URL link button. Callback buttons are unsupported; use ask_user_question for choices.',
   properties: {
     label: { type: 'string' as const, minLength: 1 },
-    url: { type: 'string' as const, minLength: 1 },
+    // A link button has to go somewhere. A placeholder like '#' or a bare path
+    // renders as a dead link, and an agent asked for an approval card reaches
+    // for exactly that: it cannot make a callback button, so it fakes one.
+    // Requiring a scheme keeps https:, mailto: and tel: while rejecting '#'
+    // and '/docs', and the dropped-action message then points at the tool that
+    // does make buttons.
+    url: {
+      type: 'string' as const,
+      minLength: 1,
+      pattern: '^[a-zA-Z][a-zA-Z0-9+.-]*:',
+      description: "Absolute URL, scheme included, e.g. 'https://example.com'.",
+    },
     style: {
       description: "One of 'primary', 'danger' or 'default'; any other value renders as 'default'.",
     },
@@ -188,7 +199,7 @@ export const sendCard: McpToolDefinition = {
         card: {
           type: 'object',
           description:
-            'Display card with optional title, description, text children, and URL link actions. Each action requires a non-empty label and url; invalid actions are dropped. Callback buttons are unsupported; use ask_user_question for choices.',
+            'Display card with optional title, description, text children, and URL link actions. Each action requires a non-empty label and an absolute url; invalid actions are dropped. Callback buttons are unsupported; use ask_user_question for choices.',
           properties: {
             title: { type: 'string' },
             description: { type: 'string' },
@@ -242,7 +253,7 @@ export const sendCard: McpToolDefinition = {
     log(`send_card: ${id}`);
     if (dropped > 0) {
       return ok(
-        `Card sent (id: ${id}). ${dropped} invalid action(s) were dropped: send_card link actions require both a non-empty label and url. Use ask_user_question for callback buttons.`,
+        `Card sent (id: ${id}). ${dropped} invalid action(s) were dropped: send_card link actions need a non-empty label and an absolute url such as https://example.com. Use ask_user_question for callback buttons.`,
       );
     }
     return ok(`Card sent (id: ${id})`);
