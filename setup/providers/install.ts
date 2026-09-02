@@ -18,15 +18,21 @@
  *      ends with `nc:run effect:build` / `effect:test` / `effect:external` (the
  *      external one re-invokes `--step provider-auth`, which would recurse). The
  *      setup flow already rebuilds the image and runs auth around this call, so
- *      we scope `exec` to apply only the file-mutating commands the engine emits
- *      (the `nc:copy from-branch` git fetch/show) and skip those heavyweight run
- *      directives. The fork-aware remote resolver remains available for skills
- *      that carry remote copy directives; self-contained payloads do not use it.
+ *      those run effects are skipped via `skipEffects` (and `exec` additionally
+ *      refuses them), leaving only the file-mutating commands the engine emits
+ *      (the `nc:copy from-branch` git fetch/show). The fork-aware remote
+ *      resolver remains available for skills that carry remote copy directives;
+ *      self-contained payloads do not use it.
+ *
+ * This is an INSTALL, not a refresh: an already-wired payload is skipped, so a
+ * re-run (every `--step provider-auth <name>`) is a no-op over the installed
+ * code and never overwrites a local patch. `/update-skills` is the refresh path.
  *
  * Returns the engine's ApplyResult so the caller can decide whether a rebuild is
- * warranted (a fresh install always applied something) and surface any step the
- * engine couldn't apply deterministically (agentTasks / deferred → install
- * failed: a provider install is fully deterministic with no prompts).
+ * warranted (a fresh install applied something; a re-run over an installed
+ * provider applied nothing) and surface any step the engine couldn't apply
+ * deterministically (agentTasks / deferred → install failed: a provider install
+ * is fully deterministic with no prompts).
  */
 import { execSync } from 'node:child_process';
 
@@ -48,7 +54,7 @@ function isFlowOwnedCommand(cmd: string): boolean {
 
 export interface ProviderInstallResult {
   apply: ApplyResult;
-  /** True when the engine applied at least one mutation (fresh/refreshed install). */
+  /** True when the engine applied at least one file mutation (a fresh install). False on a re-run over an installed provider. */
   changed: boolean;
   /** Non-deterministic leftovers — non-empty means the install did not fully apply. */
   blockers: string[];
@@ -59,12 +65,21 @@ export async function applyProviderSkill(skillDir: string, projectRoot: string):
   // separately). No resolveInput is passed: absent ⇒ any prompt defers, which
   // is exactly the old defer-all stub's semantics with no stub to maintain.
   const result = await applySkill(skillDir, projectRoot, {
-    // Setup is also the upgrade path for an already-installed provider. Refresh
-    // replaces canonical payload files and updates exact dependency/manifest
-    // pins while preserving the directive engine's idempotent append behavior.
-    mode: 'refresh',
+    // Install mode (the engine's default): a present payload file, barrel line,
+    // dependency, or manifest entry is skipped, never overwritten. This runs on
+    // EVERY `--step provider-auth <name>` — an expired token, a second backend
+    // — so it must not clobber an operator's local patch or force an image
+    // rebuild. Refreshing installed payload code to the current registry bytes
+    // and pins is `/update-skills` (scripts/update-skills.ts, refresh mode),
+    // which requires a clean working tree first.
+    //
+    // Build, test, and the auth re-invocation are the surrounding flow's job:
+    // skip them at the engine level so they land in `skipped`, not `applied`,
+    // and `changed` reflects real file mutations only (a bare no-op exec would
+    // still count each run as applied and rebuild the image on every re-auth).
+    skipEffects: ['build', 'test', 'external'],
     exec: (cmd) => {
-      if (isFlowOwnedCommand(cmd)) return; // build/test/auth are the flow's job
+      if (isFlowOwnedCommand(cmd)) return; // belt-and-braces for an untagged run
       execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
     },
     // Fork-aware: reuse the existing resolver (handles upstream/fork remotes and

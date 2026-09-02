@@ -121,7 +121,13 @@ describe('opencode installs from its hard-wired self-contained skill', () => {
     expect(read('setup/provider-auth.ts')).toContain("opencode: '.claude/skills/add-opencode'");
   });
 
-  it('refreshes an existing provider payload and version pins', () => {
-    expect(read('setup/providers/install.ts')).toContain("mode: 'refresh'");
+  it('installs in the engine default mode — re-auth never overwrites an installed payload', () => {
+    // `--step provider-auth <name>` re-runs the install on every auth; refresh
+    // mode would re-copy payload files over local patches and rebuild the
+    // image each time. Payload refresh belongs to /update-skills only
+    // (behavioral coverage: setup/providers/install.test.ts).
+    const src = read('setup/providers/install.ts');
+    expect(src).not.toContain("mode: 'refresh'");
+    expect(src).toContain("skipEffects: ['build', 'test', 'external']");
   });
 });

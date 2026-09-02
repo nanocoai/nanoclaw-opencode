@@ -307,7 +307,7 @@ export interface ApplyOptions {
   execStream?: (cmd: string) => Promise<StepOutcome>;
   // Run effects the CALLER owns and will perform itself — those runs are skipped
   // (not executed). e.g. a headless rebuild or a setup that restarts once at the
-  // end passes ['restart']; applyProviderSkill passes ['build','test'].
+  // end passes ['restart']; applyProviderSkill passes ['build','test','external'].
   skipEffects?: string[];
   // Resolve which remote carries a `from-branch` registry branch. Defaults to a
   // generic resolver (env override → first remote that has the branch → origin);

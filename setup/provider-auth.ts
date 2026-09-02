@@ -42,13 +42,16 @@ export async function run(args: string[]): Promise<void> {
   let entry = getSetupProvider(name);
   const skillDir = INSTALL_SKILLS[name];
   if (skillDir) {
-    // Install OR refresh: the skill is idempotent and is also the upgrade path
-    // — payload files resync and a bumped CLI-manifest pin replaces the local
-    // one. Applied in-process via the directive engine; build + auth are this
-    // flow's job (the engine's build/test/auth run directives are skipped), so
-    // we rebuild the image whenever the install mutated anything (the container
-    // CLI manifest is baked into the image, unlike the mounted payload code).
-    console.log(`${entry ? 'Refreshing' : 'Installing'} ${name}…`);
+    // Install only: applied in install mode, so an already-wired payload file,
+    // barrel line, or manifest pin is skipped, never overwritten — a re-run over
+    // an installed provider is a no-op that leaves local patches alone.
+    // Refreshing installed payload code and pins is `/update-skills`
+    // (scripts/update-skills.ts, refresh mode). Applied in-process via the
+    // directive engine; build + auth are this flow's job (the engine's
+    // build/test/auth run directives are skipped), so we rebuild the image
+    // whenever the install mutated anything (the container CLI manifest is
+    // baked into the image, unlike the mounted payload code).
+    console.log(`${entry ? 'Checking' : 'Installing'} ${name}…`);
     const { changed, blockers } = await applyProviderSkill(skillDir, process.cwd());
     if (blockers.length) {
       console.error(`Couldn't install ${name}: ${blockers.join('; ')}`);
