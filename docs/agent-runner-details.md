@@ -553,13 +553,26 @@ Send a structured card (interactive or display-only).
 {
   name: 'send_card',
   params: {
-    card: CardElement,     // card structure (title, children, actions)
-    fallbackText?: string, // text fallback for platforms without card support
+    card: {                // title/description, text children, URL link actions
+      title?: string,
+      description?: string,
+      children?: (string | { text: string })[],
+      actions?: { label: string; url: string; style?: string }[], // 'primary' | 'danger' | 'default'; anything else renders as default
+    },
+    fallbackText?: string, // plain-text rendering of the card, unrelated to buttons
   }
 }
 ```
 
-Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card structure in content.
+Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card
+structure in content. One schema — `LINK_ACTION_SCHEMA` in
+`container/agent-runner/src/mcp-tools/interactive.ts` — is both advertised in
+the tool's `inputSchema` and compiled once as the validator the handler runs, so
+invalid actions are filtered out before the row is written and the reported
+dropped count matches what was stored. Every link action needs a non-empty
+`label` and `url`. The bridge repeats the check, because any producer can write
+this payload. Nested action blocks and callback actions are not supported by
+this tool.
 
 #### ask_user_question
 

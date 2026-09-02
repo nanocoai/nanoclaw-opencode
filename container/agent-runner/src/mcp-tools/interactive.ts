@@ -4,6 +4,8 @@
  * ask_user_question is a blocking tool call — it writes a messages_out row
  * with a question card, then polls messages_in for the response.
  */
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
+
 import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
@@ -23,19 +25,50 @@ function routing() {
 }
 
 /**
- * Actions the bridge will drop: send_card is fire-and-forget, so only
- * `url` actions survive as link buttons (src/channels/chat-sdk-bridge.ts,
- * "Non-URL actions are dropped"). Counted here so the agent is told, instead
- * of assuming the platform cannot render buttons.
+ * The one definition of a send_card action: send_card is fire-and-forget, so
+ * only a link button survives (src/channels/chat-sdk-bridge.ts). It is both
+ * advertised in the tool's inputSchema and enforced on the payload, so the
+ * agent is never told about a shape the bridge will not render.
+ *
+ * `style` carries no constraint at all, not even a type: the bridge maps
+ * anything it does not recognize — including `null`, which is a common way for
+ * a model to fill an optional field — to the default button styling. A schema
+ * stricter than the bridge would cost the agent the whole button over its
+ * color. The allowed values live in the description, which is what the model
+ * reads.
+ *
+ * Frozen because the same object is the advertised schema and the source the
+ * validator was compiled from; a later mutation would silently desync them.
  */
-function countCallbackActions(card: Record<string, unknown>): number {
+export const LINK_ACTION_SCHEMA = Object.freeze({
+  type: 'object' as const,
+  description: 'URL link button. Callback buttons are unsupported; use ask_user_question for choices.',
+  properties: {
+    label: { type: 'string' as const, minLength: 1 },
+    url: { type: 'string' as const, minLength: 1 },
+    style: {
+      description: "One of 'primary', 'danger' or 'default'; any other value renders as 'default'.",
+    },
+  },
+  required: ['label', 'url'],
+});
+
+/** Compiled once: the handler runs it per action on every send_card call. */
+const validateLinkAction = new AjvJsonSchemaValidator().getValidator<Record<string, unknown>>(LINK_ACTION_SCHEMA);
+
+/**
+ * Split a card's actions into the ones the bridge will render and a count of
+ * the ones it would drop. Invalid entries — including `null`, which would
+ * crash the bridge's property reads — never reach the payload.
+ */
+function partitionActions(card: Record<string, unknown>): { card: Record<string, unknown>; dropped: number } {
   const actions = card.actions;
-  if (!Array.isArray(actions)) return 0;
-  return actions.filter((a) => {
-    if (!a || typeof a !== 'object') return true;
-    const url = (a as Record<string, unknown>).url;
-    return !(typeof url === 'string' && url);
-  }).length;
+  if (!Array.isArray(actions)) return { card, dropped: 0 };
+
+  const valid = actions.filter((action) => validateLinkAction(action).valid);
+  if (valid.length === actions.length) return { card, dropped: 0 };
+
+  return { card: { ...card, actions: valid }, dropped: actions.length - valid.length };
 }
 
 function ok(text: string) {
@@ -148,14 +181,37 @@ export const askUserQuestion: McpToolDefinition = {
 export const sendCard: McpToolDefinition = {
   tool: {
     name: 'send_card',
-    description: 'Send a structured card (interactive or display-only) to the current conversation.',
+    description: 'Send a display card with optional URL link buttons to the current conversation.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         card: {
           type: 'object',
           description:
-            'Card structure with title, description, and optional children/actions. Actions need a url and render as link buttons; actions without a url are dropped on every channel. For clickable buttons use ask_user_question.',
+            'Display card with optional title, description, text children, and URL link actions. Each action requires a non-empty label and url; invalid actions are dropped. Callback buttons are unsupported; use ask_user_question for choices.',
+          properties: {
+            title: { type: 'string' },
+            description: { type: 'string' },
+            children: {
+              type: 'array',
+              description:
+                'Text content only: strings or objects with a text field. Nested action blocks are unsupported.',
+              items: {
+                anyOf: [
+                  { type: 'string' },
+                  {
+                    type: 'object',
+                    properties: { text: { type: 'string' } },
+                    required: ['text'],
+                  },
+                ],
+              },
+            },
+            actions: {
+              type: 'array',
+              items: LINK_ACTION_SCHEMA,
+            },
+          },
         },
         fallbackText: {
           type: 'string',
@@ -172,6 +228,7 @@ export const sendCard: McpToolDefinition = {
 
     const id = generateId();
     const r = routing();
+    const { card: renderable, dropped } = partitionActions(card);
 
     await writeMessageOut({
       id,
@@ -179,14 +236,13 @@ export const sendCard: McpToolDefinition = {
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
-      content: JSON.stringify({ type: 'card', card, fallbackText: (args.fallbackText as string) || '' }),
+      content: JSON.stringify({ type: 'card', card: renderable, fallbackText: (args.fallbackText as string) || '' }),
     });
 
     log(`send_card: ${id}`);
-    const dropped = countCallbackActions(card);
     if (dropped > 0) {
       return ok(
-        `Card sent (id: ${id}). ${dropped} action(s) without a url were dropped: send_card never renders callback buttons on any channel. Use ask_user_question for buttons.`,
+        `Card sent (id: ${id}). ${dropped} invalid action(s) were dropped: send_card link actions require both a non-empty label and url. Use ask_user_question for callback buttons.`,
       );
     }
     return ok(`Card sent (id: ${id})`);
