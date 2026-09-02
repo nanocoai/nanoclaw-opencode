@@ -387,6 +387,13 @@ export async function processQuery(
   let unwrappedNudged = false;
   const outstanding: Array<{ target: ReplyTarget; nudged: boolean }> =
     toolsOnly ? (routing.replyTargets ?? []).map((target) => ({ target, nudged: false })) : [];
+  // Every human request this query has ever held as a reply target — still
+  // open or already settled. Reconciliation uses it so a row stamped for a
+  // request that was settled earlier in the query (a send_file after the
+  // send_message that paid it off, a stamp read before a follow-up refresh)
+  // stays attributed to that request instead of falling to the route leg and
+  // paying off somebody else's. Filled by reconcileToolsOnlyDeliveries.
+  const knownRequestIds = new Set<string>();
   let lastJudgedSeq = initialDeliveryBaseline ?? getMaxOutboundSeq();
   // Once-per-turn guard for the task-run "<message> block was not delivered"
   // nudge — mirrors unwrappedNudged for chat turns.
@@ -518,6 +525,18 @@ export async function processQuery(
         if (toolsOnly) {
           for (const target of replyTargetsFor(keep)) outstanding.push({ target, nudged: false });
         }
+        // Re-point the outbound reply stamp at this follow-up, the same way
+        // the outer loop stamps a fresh batch: from here on the agent is
+        // answering it, so a `send_message` / `send_file` row must carry ITS
+        // id — tools-only reconciliation matches `in_reply_to` against the
+        // follow-up's reply target, and the a2a return path resolves the
+        // origin session from it. The envelope door already attributes a
+        // block to the latest inbound row on its channel (sendToDestination);
+        // this keeps the tool door on the same policy. Without it the stamp
+        // stays pinned to the outer batch — for a provider that keeps one
+        // query open across turns, the container's very first message — for
+        // the container's whole lifetime.
+        setCurrentInReplyTo(extractRouting(keep).inReplyTo);
         query.push(prompt, extractPromptAttachments(keep));
         archivePrompts.push(prompt);
         markCompleted(keptIds);
@@ -590,7 +609,7 @@ export async function processQuery(
         markCompleted(initialBatchIds);
         if (toolsOnly && event.isError === true) {
           log(`Tools-only provider error (not forwarded): ${(event.text ?? '').slice(0, 500)}`);
-          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
           for (const { target } of outstanding) {
             lastJudgedSeq = await writeToReplyTarget(target, TOOLS_ONLY_ERROR_NOTICE);
           }
@@ -629,7 +648,7 @@ export async function processQuery(
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text);
           if (toolsOnly) {
             const beforeCount = outstanding.length;
-            lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+            lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
             const anyDelivered = outstanding.length < beforeCount;
             const spent = outstanding.filter((entry) => entry.nudged);
             for (const { target } of spent) {
@@ -702,7 +721,7 @@ export async function processQuery(
             if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
           }
         } else if (toolsOnly) {
-          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
           const spent = outstanding.filter((entry) => entry.nudged);
           for (const { target } of spent) {
             lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
@@ -735,7 +754,7 @@ export async function processQuery(
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     if (toolsOnly) {
-      lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, lastJudgedSeq);
+      lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
       for (const { target } of outstanding) {
         lastJudgedSeq = await writeToReplyTarget(target, TOOLS_ONLY_ERROR_NOTICE);
       }
@@ -801,8 +820,12 @@ function deliverToolsOnlyPlaceholder(target: ReplyTarget): Promise<number> {
 
 function reconcileToolsOnlyDeliveries(
   outstanding: Array<{ target: ReplyTarget; nudged: boolean }>,
+  knownRequestIds: Set<string>,
   afterSeq: number,
 ): number {
+  for (const { target } of outstanding) {
+    if (target.inReplyTo !== null) knownRequestIds.add(target.inReplyTo);
+  }
   const rows = getOutboundMessagesAfter(afterSeq);
   let highWater = afterSeq;
   const delivered = new Set<number>();
@@ -815,14 +838,38 @@ function reconcileToolsOnlyDeliveries(
     } catch {
       // Unparseable chat content is still a visible outbound message.
     }
-    outstanding.forEach(({ target }, index) => {
-      const exactReply = row.in_reply_to !== null && row.in_reply_to === target.inReplyTo;
-      const exactRoute =
-        row.platform_id === target.platformId &&
-        row.channel_type === target.channelType &&
-        row.thread_id === target.threadId;
-      if (exactReply || exactRoute) delivered.add(index);
-    });
+    // Leg 1 — exact stamp. A row whose in_reply_to names a request this query
+    // has held — still open, paid off earlier in this pass (send_message then
+    // send_file to the same asker), or settled in an earlier turn — belongs
+    // to THAT request and nothing else. It never reaches the route leg, so it
+    // can never absorb another asker's request on the same chat.
+    if (row.in_reply_to !== null && knownRequestIds.has(row.in_reply_to)) {
+      const stamped = outstanding.findIndex(({ target }) => target.inReplyTo === row.in_reply_to);
+      if (stamped !== -1) delivered.add(stamped);
+      continue;
+    }
+    // Leg 2 — route, for rows whose stamp names no request of this query (a
+    // stale stamp, or none). A row pinned to a thread satisfies the requests
+    // from that exact thread on that chat. A THREAD-LESS row on the chat:
+    // `send_message` stamps its thread from session_routing, which is NULL in
+    // a shared / agent-shared session even when the request arrived in a
+    // thread, so such a row is still a visible reply on the requesting
+    // surface — but one reply answers ONE request. It satisfies only the
+    // oldest still-open request on that chat; any other asker stays open so
+    // the nudge (and, failing that, the placeholder) still reaches them
+    // rather than being silently dropped.
+    const sameChatIndices = outstanding.flatMap(({ target }, index) =>
+      !delivered.has(index) && row.platform_id === target.platformId && row.channel_type === target.channelType
+        ? [index]
+        : [],
+    );
+    if (row.thread_id === null) {
+      if (sameChatIndices.length > 0) delivered.add(sameChatIndices[0]);
+    } else {
+      for (const index of sameChatIndices) {
+        if (outstanding[index].target.threadId === row.thread_id) delivered.add(index);
+      }
+    }
   }
   if (delivered.size > 0) {
     const remaining = outstanding.filter((_entry, index) => !delivered.has(index));

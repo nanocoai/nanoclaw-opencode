@@ -53,6 +53,8 @@ interface ProviderOptions {
   additionalDirectories?: string[];
   model?: string;   // alias (sonnet/opus/haiku) or full model ID
   effort?: string;  // low | medium | high | xhigh | max
+  deliveryMode?: 'envelope' | 'tools-only';  // the contract the poll-loop enforces; providers
+                                             // that re-state it (e.g. after compaction) must match
 }
 
 interface QueryInput {
@@ -287,72 +289,59 @@ class CodexProvider implements AgentProvider {
 
 ### OpenCode Provider
 
-Wraps `@opencode-ai/sdk`.
+Wraps `@opencode-ai/sdk` (`container/agent-runner/src/providers/opencode.ts`).
 
-```typescript
-class OpenCodeProvider implements AgentProvider {
-  query(input: QueryInput): AgentQuery {
-    // OpenCode runs a local server — create it once, reuse across queries
-    const { client, server } = await createOpencode({ config: this.buildConfig(input) });
-    const { stream } = await client.event.subscribe();
+**One shared server per container.** The first `query()` spawns `opencode serve`
+(port 4096, detached process group) and subscribes to its SSE event stream; every
+later query reuses that runtime as long as the config key (model, provider, MCP
+servers, cwd) is unchanged. The lifecycle is self-healing: a failed init is never
+cached (a slow listen line or a stolen port costs one turn, not the container's
+lifetime), a spawned server whose client setup fails is reaped rather than left
+holding the port, and a server that exits or whose stream ends drops itself from
+the cache so the next turn respawns it.
 
-    let aborted = false;
-    let pendingFollowUp: string | null = null;
+**Turns.** A query creates one OpenCode session (or resumes the stored
+continuation), yields `init`, and then runs each prompt — the opening one and
+every `push()` — as `session.promptAsync` followed by reading the shared stream
+until that session's `session.idle`. Events are filtered by `sessionID` because
+the stream carries every session on the server. A resume that produces no
+assistant work falls back once to a fresh session (see `isEmptyOpenCodeResume`).
 
-    return {
-      push: (msg) => {
-        pendingFollowUp = msg;
-        server.close();  // interrupt current query
-      },
-      end: () => { /* no-op */ },
-      abort: () => { aborted = true; server.close(); },
-      events: this.run(client, server, stream, input, () => pendingFollowUp),
-    };
-  }
+**Abort.** `abort()` calls `session.abort` on the turn the generator has in
+flight and leaves the server running — a `/clear` or `/compact` no longer costs a
+respawn. A turn parked in `session.create()` or `promptAsync()` when the abort
+lands re-checks on resume, stops the session it just obtained, and returns
+without processing it. An aborted turn never triggers the empty-resume fallback.
 
-  private async *run(client, server, stream, input, getPendingFollowUp): AsyncIterable<ProviderEvent> {
-    const session = await client.session.create();
-    yield { type: 'init', continuation: session.data.id };
+**Watchdogs (two tiers, both per turn):**
 
-    await client.session.promptAsync({
-      path: { id: session.data.id },
-      body: { parts: [{ type: 'text', text: input.prompt }] },
-    });
+| Tier | Trips when | Action | Env knob (ms) |
+|------|-----------|--------|---------------|
+| Stream silence | no event of any kind — the server's 10 s `server.heartbeat` included — for the budget | server is dead or wedged: `destroySharedRuntime()` aborts the SSE subscription (which is what wakes the parked read; a SIGKILL alone would not, the SDK reconnects forever) and kills the process group; turn errors `OpenCode event stream silent for N ms; server dropped`; next turn respawns | `OPENCODE_STREAM_SILENCE_MS`, default 60000 |
+| Activity | stream alive but no agent activity event for the budget | backend is wedged: `session.abort` for that session only; turn errors `OpenCode turn produced no activity for N ms; aborted`; server stays | `OPENCODE_IDLE_TIMEOUT_MS`, default 900000 (15 min) |
 
-    for await (const event of stream) {
-      if (event.type === 'session.idle') {
-        // Collect result text from accumulated message parts
-        const resultText = this.extractResult(event);
-        yield { type: 'result', text: resultText };
+Neither tier covers a `session.create()` or `promptAsync()` POST that never
+returns — the watchdog interval starts once the prompt is accepted — so that
+case is bounded by the host sweep's stale-heartbeat kill of the container.
+The SSE subscription has no retry cap on purpose: the SDK counts reconnect
+attempts cumulatively per subscription and never resets them, so a cap would
+end a long-lived container's stream for good on the Nth transient `/event`
+hiccup; the abort signal and the silence tier are the stops.
 
-        const followUp = getPendingFollowUp();
-        if (followUp) {
-          await client.session.promptAsync({
-            path: { id: session.data.id },
-            body: { parts: [{ type: 'text', text: followUp }] },
-          });
-          continue;
-        }
-
-        return;
-      }
-
-      if (event.type === 'session.error') {
-        yield { type: 'error', message: event.properties?.error?.data?.message, retryable: false };
-        return;
-      }
-    }
-  }
-}
-```
+Heartbeats count as liveness for the first tier only; they are not agent
+activity, so the runner's own heartbeat file stays tied to real work. Neither
+error clears the stored continuation: `isSessionInvalid` fires only on
+OpenCode's own `NotFoundError` for the session id (the server's
+`Session not found: <id>`, HTTP 404), never on backend/model errors, connection
+resets, or watchdog errors — the on-disk session is intact in all of those.
 
 **OpenCode-specific behavior inside the provider:**
-- Local gRPC/HTTP server lifecycle (`server.close()`)
-- SSE event stream for output
-- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`)
+- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`, `OPENCODE_SMALL_MODEL`)
 - MCP config format translation (`type: 'local'`, `command: [cmd, ...args]`, `environment`)
 - System prompt injected via `<system>` prefix in prompt text
-- No resume support (sessions are always new or reused by ID)
+- Memory delivered by running the registered session hook at startup and after `session.compacted`; a routing-discipline reminder rides the first prompt after a compaction
+- Interactive `question` tool denied in config and auto-answered on the stream as a belt-and-suspenders guard
+- Resume is by session id: the stored continuation is the OpenCode session id
 
 ## Agent-Runner Core
 

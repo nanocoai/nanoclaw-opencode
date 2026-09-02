@@ -1,3 +1,4 @@
+import type { DeliveryMode } from '../config.js';
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 
 export interface AgentProvider {
@@ -98,6 +99,14 @@ export interface ProviderOptions {
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   fastMode?: boolean;
+  /**
+   * How this session's replies reach humans — `envelope` (<message to>
+   * blocks in the final text) or `tools-only` (only outbound MCP tool calls
+   * deliver). The poll-loop enforces it; a provider that re-states the
+   * delivery contract itself (e.g. after an SDK-side compaction) must teach
+   * the same mode. Defaults to `envelope` when omitted.
+   */
+  deliveryMode?: DeliveryMode;
 }
 
 /**

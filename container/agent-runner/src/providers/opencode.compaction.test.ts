@@ -67,14 +67,22 @@ describe('createCompactionReminder', () => {
 });
 
 describe('buildPostCompactionReminder', () => {
+  // bun:test runs every file in one process, and the composed default factory
+  // (`src/modules/index.ts` preload) is registered exactly once. Capture it so
+  // afterEach can hand it back — mirrors `mailbox/registry.test.ts`; without
+  // this, every later file that reaches the mailbox fails with
+  // "No agent mailbox registered".
+  let composedFactory: ReturnType<typeof resetAgentMailboxForTesting>;
+
   beforeEach(() => {
-    resetAgentMailboxForTesting();
+    composedFactory = resetAgentMailboxForTesting();
     initTestSessionDb();
     registerAgentMailbox(() => new SqliteAgentMailbox());
   });
   afterEach(() => {
     resetAgentMailboxForTesting();
     closeSessionDb();
+    if (composedFactory) registerAgentMailbox(composedFactory);
   });
 
   function seedDestination(name: string): void {
