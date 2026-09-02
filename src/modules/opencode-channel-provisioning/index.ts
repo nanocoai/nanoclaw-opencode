@@ -2,6 +2,7 @@ import type { InboundEvent } from '../../channels/adapter.js';
 import { readEnvFile } from '../../env.js';
 import { onHostStart } from '../../host-lifecycle.js';
 import { registerMigration } from '../../db/migrations/index.js';
+import { log } from '../../log.js';
 import type { ResponsePayload } from '../../response-registry.js';
 import {
   registerChannelAgentProvisioner,
@@ -10,6 +11,7 @@ import {
 import {
   beginState,
   deleteState,
+  disableEnvironmentProvider,
   getProvider,
   getState,
   listProviders,
@@ -23,6 +25,8 @@ import { opencodeChannelProvisioningMigration } from './migration.js';
 import type { DiscoveredOpenCodeModel, OpenCodeModelProvider } from './types.js';
 import './cli-resource.js';
 
+/** Every button value this wizard renders starts with this; anything else belongs to core. */
+const OWNED_VALUE_PREFIX = 'opencode_';
 const PROVIDER_PREFIX = 'opencode_provider:';
 const CATALOG_PROVIDER_PREFIX = 'opencode_catalog_provider:';
 const PROVIDER_PAGE_PREFIX = 'opencode_provider_page:';
@@ -66,18 +70,30 @@ onHostStart(async () => {
     'OPENCODE_MODEL_INPUT_MODALITIES',
   ]);
   const providerId = (process.env.OPENCODE_PROVIDER ?? env.OPENCODE_PROVIDER)?.trim().toLowerCase();
-  if (!providerId) return;
   const positive = (raw: string | undefined) => {
     const value = Number(raw);
     return Number.isSafeInteger(value) && value > 0 ? value : undefined;
   };
-  await syncEnvironmentProvider({
-    providerId,
-    baseUrl: process.env.ANTHROPIC_BASE_URL ?? env.ANTHROPIC_BASE_URL,
-    contextLimit: positive(process.env.OPENCODE_MODEL_CONTEXT_LIMIT ?? env.OPENCODE_MODEL_CONTEXT_LIMIT),
-    outputLimit: positive(process.env.OPENCODE_MODEL_OUTPUT_LIMIT ?? env.OPENCODE_MODEL_OUTPUT_LIMIT),
-    inputModalities: process.env.OPENCODE_MODEL_INPUT_MODALITIES ?? env.OPENCODE_MODEL_INPUT_MODALITIES,
-  });
+  // The environment-default connection mirrors .env (see db.ts). It is a
+  // convenience for the registration wizard, never worth the host: a start
+  // callback that throws aborts startup and, under launchd/systemd, crash-loops.
+  /* eslint-disable no-catch-all/no-catch-all -- see above; the failure is logged and registration continues without the mirror row */
+  try {
+    if (!providerId) {
+      await disableEnvironmentProvider();
+      return;
+    }
+    await syncEnvironmentProvider({
+      providerId,
+      baseUrl: process.env.ANTHROPIC_BASE_URL ?? env.ANTHROPIC_BASE_URL,
+      contextLimit: positive(process.env.OPENCODE_MODEL_CONTEXT_LIMIT ?? env.OPENCODE_MODEL_CONTEXT_LIMIT),
+      outputLimit: positive(process.env.OPENCODE_MODEL_OUTPUT_LIMIT ?? env.OPENCODE_MODEL_OUTPUT_LIMIT),
+      inputModalities: process.env.OPENCODE_MODEL_INPUT_MODALITIES ?? env.OPENCODE_MODEL_INPUT_MODALITIES,
+    });
+  } catch (err) {
+    log.error('OpenCode environment-default connection sync failed — registration continues without it', { err });
+  }
+  /* eslint-enable no-catch-all/no-catch-all */
 });
 
 function messageText(event: InboundEvent): string {
@@ -447,6 +463,15 @@ registerChannelAgentProvisioner({
       await cancel(context);
       return true;
     }
+    if (!payload.value.startsWith(OWNED_VALUE_PREFIX)) {
+      // A core registration button while this wizard is in flight — the
+      // original card's still-live "Connect to X", or a selection card's
+      // connect button: the approver changed their mind. Abandon the wizard,
+      // say so, and hand the button back to core as if it had never started.
+      await deleteState(context.row.messaging_group_id);
+      await context.deliverText('OpenCode agent creation cancelled — continuing with the option you just chose.');
+      return false;
+    }
     if (payload.value === BROWSE_PROVIDERS) {
       if (state.step !== 'awaiting_provider') return true;
       await offerProviderCatalog(context);
@@ -579,8 +604,8 @@ registerChannelAgentProvisioner({
       );
       return true;
     }
-    // A durable OpenCode state owns this question id. Claim stale buttons from
-    // earlier cards so they cannot fall through to core and bypass confirmation.
+    // A stale OpenCode button from an earlier step of this wizard (wrong step
+    // for its value). Claim it: nothing to do, and it must not reach core.
     return true;
   },
 });

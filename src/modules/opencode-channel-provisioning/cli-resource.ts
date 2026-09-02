@@ -1,4 +1,15 @@
 import { registerResource } from '../../cli/crud.js';
+import { getDb } from '../../db/connection.js';
+import { ENVIRONMENT_PROVIDER_ID } from './db.js';
+
+const ENVIRONMENT_ROW_MESSAGE =
+  `${ENVIRONMENT_PROVIDER_ID} mirrors .env (OPENCODE_PROVIDER, ANTHROPIC_BASE_URL, OPENCODE_MODEL_CONTEXT_LIMIT, ` +
+  'OPENCODE_MODEL_OUTPUT_LIMIT, OPENCODE_MODEL_INPUT_MODALITIES) and is re-synced on every host start, so it cannot ' +
+  'be changed here. Edit .env and restart the host (unset OPENCODE_PROVIDER to disable it), or create a separate connection.';
+
+function rejectEnvironmentRow(id: unknown): void {
+  if (id === ENVIRONMENT_PROVIDER_ID) throw new Error(ENVIRONMENT_ROW_MESSAGE);
+}
 
 function text(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
@@ -83,13 +94,32 @@ registerResource({
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
     { name: 'updated_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval', delete: 'approval' },
+  // `delete` is a custom verb below: the generic one has no pre-delete hook,
+  // and the environment-default row must be refused there too.
+  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval' },
   naturalKey: ['name'],
   resolveDefaults: validate,
   preUpdate: (updates, current) => {
+    rejectEnvironmentRow(current.id);
     const merged = { ...current, ...updates };
     validate(merged);
     for (const key of Object.keys(updates)) updates[key] = merged[key];
     updates.updated_at = new Date().toISOString();
+  },
+  customOperations: {
+    delete: {
+      access: 'approval',
+      description:
+        'Delete an OpenCode model provider connection. Use --id <connection-id>. ' +
+        `The ${ENVIRONMENT_PROVIDER_ID} connection mirrors .env and is refused — unset OPENCODE_PROVIDER instead.`,
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('OpenCode model provider id is required');
+        rejectEnvironmentRow(id);
+        const result = await getDb().run('DELETE FROM opencode_model_providers WHERE id = ?', id);
+        if (result.changes === 0) throw new Error(`OpenCode model provider not found: ${id}`);
+        return { deleted: id };
+      },
+    },
   },
 });

@@ -445,12 +445,42 @@ export async function wireApprovedChannel(
   return true;
 }
 
-function provisioningContext(row: PendingChannelApproval): ChannelAgentProvisioningContext {
+/**
+ * Adapter instance the approver conversation goes through: the originating
+ * channel's instance when the approver acts on that platform (one bot per
+ * agent group — the registration card went out through it, see
+ * `pickApprovalDelivery`), otherwise unhinted. Same rule as the
+ * choose-existing / name-prompt paths in handleChannelApprovalResponse.
+ */
+async function approverInstanceFor(row: PendingChannelApproval, channelType: string): Promise<string | undefined> {
+  const origin = await getMessagingGroup(row.messaging_group_id);
+  return channelType === origin?.channel_type ? origin.instance : undefined;
+}
+
+/**
+ * Provider-provisioner view of one pending registration. `channelType` is
+ * the platform the approver's click or reply arrived on; it selects the
+ * adapter instance every prompt and card is delivered through.
+ */
+async function provisioningContext(
+  row: PendingChannelApproval,
+  channelType: string,
+): Promise<ChannelAgentProvisioningContext> {
+  const instance = await approverInstanceFor(row, channelType);
+  const resolveApproverDm = () => ensureUserDm(row.approver_user_id, { instance });
   return {
     row,
-    isApproverDm: (event) => isCachedUserDmEvent(row.approver_user_id, event),
+    async isApproverDm(event) {
+      if (await isCachedUserDmEvent(row.approver_user_id, event)) return true;
+      // The user_dms cache holds default-instance rows only. A named
+      // instance's DM is re-resolved (idempotent openDM) and matched exactly.
+      if (instance === undefined || instance === event.channelType) return false;
+      if ((event.instance ?? event.channelType) !== instance) return false;
+      const dm = await resolveApproverDm();
+      return dm !== null && dm.channel_type === event.channelType && dm.platform_id === event.platformId;
+    },
     async deliverQuestion(title, question, rawOptions) {
-      const approverDm = await ensureUserDm(row.approver_user_id);
+      const approverDm = await resolveApproverDm();
       const adapter = getDeliveryAdapter();
       if (!approverDm || !adapter) return false;
       const options = normalizeOptions(rawOptions);
@@ -475,7 +505,7 @@ function provisioningContext(row: PendingChannelApproval): ChannelAgentProvision
       }
     },
     async deliverText(text) {
-      const approverDm = await ensureUserDm(row.approver_user_id);
+      const approverDm = await resolveApproverDm();
       const adapter = getDeliveryAdapter();
       if (!approverDm || !adapter) return;
       try {
@@ -610,7 +640,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   if (payload.value === NEW_AGENT_VALUE) {
     const provisioner = getChannelAgentProvisioner(DEFAULT_AGENT_PROVIDER);
     if (provisioner) {
-      await provisioner.start(provisioningContext(row));
+      await provisioner.start(await provisioningContext(row, payload.channelType));
       return true;
     }
     const origin = await getMessagingGroup(row.messaging_group_id);
@@ -660,9 +690,15 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   // Continue any already-started provider flow even if the instance default
-  // changes during a host restart. Unrelated provisioners return false.
-  for (const provisioner of getChannelAgentProvisioners()) {
-    if (await provisioner.handleResponse(provisioningContext(row), payload)) return true;
+  // changes during a host restart. Unrelated provisioners return false, and so
+  // does the active one for a core button (connect:<id>) — it abandons its
+  // wizard first — so the branches below still handle it.
+  const provisioners = getChannelAgentProvisioners();
+  if (provisioners.length > 0) {
+    const context = await provisioningContext(row, payload.channelType);
+    for (const provisioner of provisioners) {
+      if (await provisioner.handleResponse(context, payload)) return true;
+    }
   }
 
   // ── Resolve target agent group (connect to existing or create new) ──
@@ -715,7 +751,7 @@ registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     if (!messagingGroupId) continue;
     const provisionerRow = await getPendingChannelApproval(messagingGroupId);
     if (!provisionerRow) continue;
-    return provisioner.handleText(provisioningContext(provisionerRow), event, userId);
+    return provisioner.handleText(await provisioningContext(provisionerRow, event.channelType), event, userId);
   }
 
   const pending = awaitingNameInput.get(userId);

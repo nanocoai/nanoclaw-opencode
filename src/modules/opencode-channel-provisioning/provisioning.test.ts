@@ -1,4 +1,48 @@
+import fs from 'fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const TEST_DIR = '/tmp/nanoclaw-test-opencode-provisioning';
+
+// Outbound deliveries captured across the real core registration flow
+// (hoisted: the delivery mock factory runs during module import).
+const delivered = vi.hoisted(
+  () => [] as Array<{ channelType: string; platformId: string; instance?: string; content: Record<string, unknown> }>,
+);
+
+vi.mock('../../container-runner.js', () => ({
+  wakeContainer: vi.fn().mockResolvedValue(undefined),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  killContainer: vi.fn(),
+}));
+
+vi.mock('../../delivery.js', () => ({
+  onDeliveryAdapterReady: () => {},
+  getDeliveryAdapter: () => ({
+    deliver: async (
+      channelType: string,
+      platformId: string,
+      _threadId: string | null,
+      _kind: string,
+      content: string,
+      _files: unknown,
+      instance?: string,
+    ) => {
+      delivered.push({ channelType, platformId, instance, content: JSON.parse(content) });
+      return 'plat-msg-id';
+    },
+  }),
+}));
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-opencode-provisioning',
+    GROUPS_DIR: '/tmp/nanoclaw-test-opencode-provisioning/groups',
+    DEFAULT_AGENT_PROVIDER: 'opencode',
+  };
+});
 
 vi.mock('./model-discovery.js', () => ({
   discoverOpenCodeProviders: vi.fn().mockResolvedValue([
@@ -29,20 +73,35 @@ vi.mock('./model-discovery.js', () => ({
   ]),
 }));
 
+import { dispatch } from '../../cli/dispatch.js';
 import { closeDb, getDb, initTestDb } from '../../db/connection.js';
 import { runMigrations } from '../../db/migrations/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { ensureContainerConfig, getContainerConfig, updateContainerConfigScalars } from '../../db/container-configs.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
+import { getHostStartCallbacks } from '../../host-lifecycle.js';
 import {
   getChannelAgentProvisioner,
   type ChannelAgentProvisioningContext,
 } from '../permissions/channel-agent-provisioner.js';
-import type { PendingChannelApproval } from '../permissions/db/pending-channel-approvals.js';
+import {
+  createPendingChannelApproval,
+  type PendingChannelApproval,
+} from '../permissions/db/pending-channel-approvals.js';
+import { upsertUser } from '../permissions/db/users.js';
+import { grantRole } from '../permissions/db/user-roles.js';
 import { getProvider, persistProviderSettings, syncEnvironmentProvider } from './db.js';
 import { opencodeChannelProvisioningMigration } from './migration.js';
 import './index.js';
 
 const now = () => new Date().toISOString();
+
+/** Run the module's real host-start hook (the .env → environment-default mirror). */
+async function runHostStart(): Promise<void> {
+  for (const start of getHostStartCallbacks()) {
+    await start({ db: getDb(), signal: new AbortController().signal });
+  }
+}
 
 describe('OpenCode channel-created agent provisioning', () => {
   beforeEach(async () => {
@@ -69,9 +128,10 @@ describe('OpenCode channel-created agent provisioning', () => {
     );
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     delete process.env.OPENCODE_AUTH_MODE;
-    closeDb();
+    delete process.env.OPENCODE_PROVIDER;
+    await closeDb();
   });
 
   it('can adopt the tables and provider_settings column left by the first-class implementation', async () => {
@@ -95,6 +155,66 @@ describe('OpenCode channel-created agent provisioning', () => {
     expect(JSON.parse(config!.provider_settings!)).toMatchObject({
       opencode: { authMode: 'chatgpt', modelProvider: 'openai' },
     });
+  });
+
+  it('keeps the host booting when an operator connection already holds the "Environment default" name', async () => {
+    await getDb().run(
+      `INSERT INTO opencode_model_providers
+       (id, name, provider_id, discovery_type, base_url, models_url, context_limit, output_limit, input_modalities, instructions, enabled, created_at, updated_at)
+       VALUES ('mine', 'Environment default', 'openrouter', 'models-dev', NULL, NULL, NULL, NULL, '', NULL, 1, ?, ?)`,
+      now(),
+      now(),
+    );
+    process.env.OPENCODE_PROVIDER = 'openai';
+    // Before the fix this rejected with UNIQUE(name) → startHostModules rethrew → process.exit(1) on every boot.
+    await expect(runHostStart()).resolves.toBeUndefined();
+    expect(await getProvider('environment-default')).toMatchObject({
+      provider_id: 'openai',
+      name: 'Environment default (.env)',
+    });
+    expect(await getProvider('mine')).toMatchObject({ name: 'Environment default', provider_id: 'openrouter' });
+  });
+
+  it('the environment-default connection mirrors .env: ncl refuses to edit it, unsetting OPENCODE_PROVIDER disables it', async () => {
+    process.env.OPENCODE_PROVIDER = 'openai';
+    await runHostStart();
+
+    const update = await dispatch(
+      { id: 'u', command: 'opencode-model-providers-update', args: { id: 'environment-default', enabled: 0 } },
+      { caller: 'host' },
+    );
+    expect(update).toMatchObject({ ok: false, error: { message: expect.stringContaining('.env') } });
+    const remove = await dispatch(
+      { id: 'd', command: 'opencode-model-providers-delete', args: { id: 'environment-default' } },
+      { caller: 'host' },
+    );
+    expect(remove).toMatchObject({ ok: false, error: { message: expect.stringContaining('.env') } });
+    expect(await getProvider('environment-default')).toMatchObject({ enabled: 1, provider_id: 'openai' });
+
+    // Operator-created connections are unaffected.
+    expect(
+      await dispatch(
+        { id: 'o', command: 'opencode-model-providers-update', args: { id: 'local', enabled: 0 } },
+        { caller: 'host' },
+      ),
+    ).toMatchObject({ ok: true });
+    expect(
+      await dispatch(
+        { id: 'x', command: 'opencode-model-providers-delete', args: { id: 'local' } },
+        { caller: 'host' },
+      ),
+    ).toMatchObject({ ok: true, data: { deleted: 'local' } });
+    expect(
+      await dispatch({ id: 'n', command: 'opencode-model-providers-delete', args: { id: 'nope' } }, { caller: 'host' }),
+    ).toMatchObject({ ok: false, error: { message: expect.stringContaining('not found') } });
+
+    // The row follows .env: clearing OPENCODE_PROVIDER hides it from the wizard.
+    delete process.env.OPENCODE_PROVIDER;
+    await runHostStart();
+    expect(await getProvider('environment-default')).toBeUndefined();
+    expect(
+      await getDb().get('SELECT enabled FROM opencode_model_providers WHERE id = ?', 'environment-default'),
+    ).toEqual({ enabled: 0 });
   });
 
   it('keeps wizard state in the DB, confirms explicitly, and persists the selected model per group', async () => {
@@ -265,7 +385,9 @@ describe('OpenCode channel-created agent provisioning', () => {
     await provisioner.handleResponse(context, response('opencode_change_provider'));
     expect(cards.at(-1)?.title).toContain('provider');
     await provisioner.handleResponse(context, response('opencode_provider:local'));
-    expect(await provisioner.handleResponse(context, response('connect:anchor'))).toBe(true);
+    // A stale OpenCode button from an earlier step is claimed and ignored — it
+    // must never create anything ahead of confirmation.
+    expect(await provisioner.handleResponse(context, response('opencode_confirm_agent'))).toBe(true);
     expect(createdBeforeConfirmation).toBe(false);
 
     await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
@@ -438,5 +560,126 @@ describe('OpenCode channel-created agent provisioning', () => {
         contextLimit: 65536,
       },
     });
+  });
+});
+
+/**
+ * Drives the real core registration handlers (permissions module) with the
+ * OpenCode provisioner installed as the instance default. The original
+ * card's buttons stay live on Slack/Discord/Mattermost after "Create new
+ * agent" is clicked, so a change of mind ("Connect to existing X") must still
+ * land — not vanish into the wizard's durable state.
+ */
+describe('OpenCode wizard hands core registration buttons back', () => {
+  const originEvent = {
+    channelType: 'fixture',
+    platformId: 'room-1',
+    threadId: null,
+    message: {
+      id: 'origin-mention',
+      kind: 'chat-sdk' as const,
+      content: JSON.stringify({ senderId: 'alice', senderName: 'Alice', text: '@bot hello' }),
+      timestamp: now(),
+      isMention: true,
+      isGroup: true,
+    },
+  };
+
+  beforeEach(async () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = await initTestDb();
+    await runMigrations(db);
+    await import('../permissions/index.js');
+    delivered.length = 0;
+
+    await createAgentGroup({ id: 'anchor', name: 'Anchor', folder: 'anchor', agent_provider: null, created_at: now() });
+    await upsertUser({ id: 'fixture:owner', kind: 'fixture', display_name: 'Owner', created_at: now() });
+    await grantRole({
+      user_id: 'fixture:owner',
+      role: 'owner',
+      agent_group_id: null,
+      granted_by: null,
+      granted_at: now(),
+    });
+    await createMessagingGroup({
+      id: 'mg-dm-owner',
+      channel_type: 'fixture',
+      platform_id: 'owner-dm',
+      name: 'Owner DM',
+      is_group: 0,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    await getDb().run(
+      'INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at) VALUES (?, ?, ?, ?)',
+      'fixture:owner',
+      'fixture',
+      'mg-dm-owner',
+      now(),
+    );
+    await createMessagingGroup({
+      id: 'origin',
+      channel_type: 'fixture',
+      platform_id: 'room-1',
+      name: 'Room',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: now(),
+    });
+    await createPendingChannelApproval({
+      messaging_group_id: 'origin',
+      agent_group_id: 'anchor',
+      original_message: JSON.stringify(originEvent),
+      approver_user_id: 'fixture:owner',
+      created_at: now(),
+      title: 'title',
+      question: 'question',
+      options_json: '[]',
+    });
+  });
+
+  afterEach(async () => {
+    await closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  async function click(value: string): Promise<void> {
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    for (const handler of getResponseHandlers()) {
+      const payload = {
+        questionId: 'origin',
+        value,
+        userId: 'owner',
+        channelType: 'fixture',
+        platformId: 'owner-dm',
+        threadId: null,
+      };
+      if (await handler(payload)) return;
+    }
+    throw new Error(`no response handler claimed ${value}`);
+  }
+
+  it('"Create new agent" then "Connect to existing" wires the existing agent and clears the wizard', async () => {
+    await click('new_agent');
+    expect(
+      await getDb().get('SELECT step FROM opencode_channel_provisioning WHERE messaging_group_id = ?', 'origin'),
+    ).toEqual({ step: 'awaiting_name' });
+    expect(delivered.at(-1)?.content.text).toContain('name for your new agent');
+
+    await click('connect:anchor');
+
+    expect(
+      await getDb().get('SELECT agent_group_id FROM messaging_group_agents WHERE messaging_group_id = ?', 'origin'),
+    ).toEqual({ agent_group_id: 'anchor' });
+    expect(
+      await getDb().get('SELECT 1 AS x FROM opencode_channel_provisioning WHERE messaging_group_id = ?', 'origin'),
+    ).toBeUndefined();
+    expect(
+      await getDb().get('SELECT 1 AS x FROM pending_channel_approvals WHERE messaging_group_id = ?', 'origin'),
+    ).toBeUndefined();
+    // The approver is told the wizard was abandoned, through their DM.
+    const notice = delivered.find((d) => String(d.content.text ?? '').includes('cancelled'));
+    expect(notice).toMatchObject({ channelType: 'fixture', platformId: 'owner-dm' });
   });
 });
