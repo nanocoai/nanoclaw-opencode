@@ -46,3 +46,24 @@ export const opencodeChannelProvisioningMigration: ModuleMigration = {
     }
   },
 };
+
+/**
+ * Wizard resume: the state row remembers the agent group its confirmation
+ * created, so a confirmation retried after a host restart reuses that group
+ * instead of minting an orphan. Additive and keyed by its own name — installs
+ * that already recorded channel-provisioning-v1 receive only this column.
+ * `ON DELETE SET NULL` keeps the pointer truthful when the group is removed.
+ */
+export const opencodeChannelProvisioningResumeMigration: ModuleMigration = {
+  version: 2,
+  name: 'module:opencode:channel-provisioning-resume-v1',
+  async up(db) {
+    const owners = await db.columnOwners?.('agent_group_id');
+    if (!owners?.includes('opencode_channel_provisioning')) {
+      await db.exec(
+        `ALTER TABLE opencode_channel_provisioning
+         ADD COLUMN agent_group_id TEXT REFERENCES agent_groups(id) ON DELETE SET NULL;`,
+      );
+    }
+  },
+};

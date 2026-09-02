@@ -41,6 +41,8 @@ export interface OpenCodeProvisioningState {
   agent_name: string | null;
   provider_id: string | null;
   model_id: string | null;
+  /** The agent group a confirmed run already created; a retry resumes it instead of creating another. */
+  agent_group_id: string | null;
   created_at: string;
   updated_at: string;
 }

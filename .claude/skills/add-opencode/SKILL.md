@@ -139,7 +139,16 @@ live and presents them as a paginated list; model search is an optional fallback
 not a required step. It requires explicit confirmation, then stores the chosen
 model and provider settings on that new group before the first container starts. Catalog providers
 expect their credentials to be available through OneCLI; secrets never enter
-the wizard state. The durable wizard row survives host restarts and works
+the wizard state. The durable wizard row survives host restarts, including the
+agent group a confirmation already created: a **Create and connect** retried
+after a restart (or after the wiring failed) reuses that group instead of
+minting a second one, and the channel wiring, the triggering sender's
+admission, and the consumption of the approval commit as one transaction, so a
+restart mid-way leaves either a fully connected channel or the still-live
+card, never a half-wired one. When the wiring does not land, the approver gets
+a fresh **Try again** / **Cancel** card (a clicked card loses its buttons on
+Chat SDK channels), and any reply in the approver's DM while confirmation is
+pending re-sends that card. The row works
 through every channel adapter using the generic approval flow; its prompts and
 cards go out through the adapter instance that delivered the registration
 card, so multi-instance installs (one bot per agent group) keep talking to the

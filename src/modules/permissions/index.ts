@@ -34,6 +34,7 @@ import { registerResponseHandler, type ResponsePayload } from '../../response-re
 import { getDeliveryAdapter } from '../../delivery.js';
 import { DEFAULT_AGENT_PROVIDER } from '../../config.js';
 import { log } from '../../log.js';
+import { getDb } from '../../db/connection.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { guard } from '../../guard/index.js';
 import { channelsRegister, sendersAdmit } from './guard.js';
@@ -399,20 +400,39 @@ export async function wireApprovedChannel(
   }
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  await createMessagingGroupAgent({
-    id: mgaId,
-    messaging_group_id: row.messaging_group_id,
-    agent_group_id: agentGroupId,
-    engage_mode: engage.engage_mode,
-    engage_pattern: engage.engage_pattern,
-    // Deliberate card-flow choices, not channel defaults: the triggering
-    // sender is auto-admitted below, so 'known' keeps other strangers gated;
-    // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
-    sender_scope: 'known',
-    ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
-    priority: 0,
-    created_at: new Date().toISOString(),
+  // The users row is harmless on its own, so it is resolved ahead of the
+  // transaction rather than inside it.
+  const senderUserId = await extractAndUpsertUser(event);
+  // Wiring, sender admission, and consumption of the approval are one central
+  // decision. A host restart (or a thrown insert) mid-way leaves either the
+  // complete wiring or the still-actionable approval, never a wired channel
+  // whose triggering sender is gated, or a wired channel whose card is still
+  // live and would wire it a second time.
+  await getDb().transaction(async () => {
+    await createMessagingGroupAgent({
+      id: mgaId,
+      messaging_group_id: row.messaging_group_id,
+      agent_group_id: agentGroupId,
+      engage_mode: engage.engage_mode,
+      engage_pattern: engage.engage_pattern,
+      // Deliberate card-flow choices, not channel defaults: the triggering
+      // sender is auto-admitted below, so 'known' keeps other strangers gated;
+      // 'accumulate' / 'shared' / priority 0 are the flow's fixed semantics.
+      sender_scope: 'known',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: new Date().toISOString(),
+    });
+    if (senderUserId) {
+      await addMember({
+        user_id: senderUserId,
+        agent_group_id: agentGroupId,
+        added_by: approverId,
+        added_at: new Date().toISOString(),
+      });
+    }
+    await deletePendingChannelApproval(row.messaging_group_id);
   });
   log.info('Channel registration approved — wiring created', {
     messagingGroupId: row.messaging_group_id,
@@ -421,18 +441,6 @@ export async function wireApprovedChannel(
     engageMode: engage.engage_mode,
     approverId,
   });
-
-  const senderUserId = await extractAndUpsertUser(event);
-  if (senderUserId) {
-    await addMember({
-      user_id: senderUserId,
-      agent_group_id: agentGroupId,
-      added_by: approverId,
-      added_at: new Date().toISOString(),
-    });
-  }
-
-  await deletePendingChannelApproval(row.messaging_group_id);
 
   try {
     await routeInbound(event);

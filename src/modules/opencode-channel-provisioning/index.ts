@@ -21,7 +21,7 @@ import {
   updateState,
 } from './db.js';
 import { discoverOpenCodeModels, discoverOpenCodeProviders } from './model-discovery.js';
-import { opencodeChannelProvisioningMigration } from './migration.js';
+import { opencodeChannelProvisioningMigration, opencodeChannelProvisioningResumeMigration } from './migration.js';
 import type { DiscoveredOpenCodeModel, OpenCodeModelProvider } from './types.js';
 import './cli-resource.js';
 
@@ -60,6 +60,7 @@ const INLINE_CONTEXT_PREFIX = '__inline_local_context__:';
 const INLINE_PROVIDER_PREFIX = '__inline_provider__:';
 
 registerMigration(opencodeChannelProvisioningMigration);
+registerMigration(opencodeChannelProvisioningResumeMigration);
 
 onHostStart(async () => {
   const env = readEnvFile([
@@ -347,10 +348,44 @@ async function offerModelSearchResults(
   ]);
 }
 
+/**
+ * The confirmation card. Chat SDK channels strip a card's buttons once one is
+ * clicked, so after a confirmation whose wiring did not land the only way to
+ * retry is a fresh card: `retryReason` renders that re-offer, and any reply in
+ * the approver's DM while confirmation is pending renders it again.
+ */
+async function offerConfirmation(
+  context: ChannelAgentProvisioningContext,
+  agentName: string,
+  modelId: string,
+  retryReason?: string,
+): Promise<void> {
+  await context.deliverQuestion(
+    retryReason ? '⚠️ OpenCode agent not connected' : '✅ Confirm new OpenCode agent',
+    retryReason ? `${retryReason} Try again, or cancel.` : `Create "${agentName}" with ${modelId}?`,
+    [
+      {
+        label: retryReason ? 'Try again' : 'Create and connect',
+        selectedLabel: retryReason ? '✅ Retrying…' : '✅ Creating…',
+        value: CONFIRM,
+        style: 'primary',
+      },
+      { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
+    ],
+  );
+}
+
 async function cancel(context: ChannelAgentProvisioningContext): Promise<void> {
+  // Read before delete: once the wizard has created the agent group (resume
+  // pointer set), cancelling only drops the connection, not the group.
+  const state = await getState(context.row.messaging_group_id);
   await deleteState(context.row.messaging_group_id);
   await context.cancel();
-  await context.deliverText('OpenCode agent creation cancelled. Mention the bot again to restart registration.');
+  await context.deliverText(
+    state?.agent_group_id
+      ? 'OpenCode connection cancelled. The agent group already created stays in place, unwired. Mention the bot again to restart registration.'
+      : 'OpenCode agent creation cancelled. Mention the bot again to restart registration.',
+  );
 }
 
 registerChannelAgentProvisioner({
@@ -374,6 +409,12 @@ registerChannelAgentProvisioner({
     if (state.step === 'awaiting_name') {
       await updateState(context.row.messaging_group_id, { step: 'awaiting_provider', agentName: text, modelId: null });
       await offerProviders(context, text);
+      return true;
+    }
+    if (state.step === 'awaiting_confirmation') {
+      // The card's buttons may be gone (clicked once, wiring failed, or the
+      // click threw before the group was recorded). Any reply brings them back.
+      if (state.agent_name && state.model_id) await offerConfirmation(context, state.agent_name, state.model_id);
       return true;
     }
     if (state.step === 'awaiting_provider' && state.provider_id === CATALOG_SEARCH) {
@@ -571,10 +612,7 @@ registerChannelAgentProvisioner({
       const model = models.find((entry) => entry.id === modelId);
       if (!model) return true;
       await updateState(context.row.messaging_group_id, { step: 'awaiting_confirmation', modelId: model.id });
-      await context.deliverQuestion('✅ Confirm new OpenCode agent', `Create "${state.agent_name}" with ${model.id}?`, [
-        { label: 'Create and connect', selectedLabel: '✅ Creating…', value: CONFIRM, style: 'primary' },
-        { label: 'Cancel', selectedLabel: '🙅 Cancelled', value: CANCEL },
-      ]);
+      await offerConfirmation(context, state.agent_name, model.id);
       return true;
     }
     if (payload.value === CONFIRM) {
@@ -585,22 +623,56 @@ registerChannelAgentProvisioner({
       const models = await discover(context, provider);
       const model = models?.find((entry) => entry.id === state.model_id);
       if (!model) return true;
-      const agent = await context.createAgent({
-        name: state.agent_name,
-        provider: 'opencode',
-        model: model.id,
-        instructions: provider.instructions ?? undefined,
-        deliveryMode: 'tools-only',
-      });
+      // A confirmation that already created its group (the host died, or the
+      // wiring failed, before the approval was consumed) resumes that exact
+      // group. The column is FK-nulled when the group is deleted, so a set
+      // value always names a live group.
+      const agent = state.agent_group_id
+        ? { id: state.agent_group_id, name: state.agent_name }
+        : await context.createAgent({
+            name: state.agent_name,
+            provider: 'opencode',
+            model: model.id,
+            instructions: provider.instructions ?? undefined,
+            deliveryMode: 'tools-only',
+          });
+      if (!state.agent_group_id) {
+        // Persist the created identity before anything that can fail below.
+        // modelId is passed through deliberately: updateState writes model_id
+        // without COALESCE, so omitting it would null the confirmed model.
+        await updateState(context.row.messaging_group_id, {
+          step: 'awaiting_confirmation',
+          modelId: state.model_id,
+          agentGroupId: agent.id,
+        });
+      }
       await persistProviderSettings(agent.id, provider, model);
       const approverId = payload.userId?.includes(':')
         ? payload.userId
         : `${payload.channelType}:${payload.userId ?? ''}`;
-      const wired = await context.wireAgent(agent.id, approverId);
-      await context.deliverText(
-        wired
-          ? `✅ OpenCode agent "${agent.name}" created with ${model.id} and connected.`
-          : `⚠️ OpenCode agent "${agent.name}" was created but the channel could not be connected.`,
+      let wired = false;
+      try {
+        wired = await context.wireAgent(agent.id, approverId);
+      } catch (err) {
+        // The wiring transaction rolled back: nothing is half-connected and
+        // the approval is still live, so the retry below is safe.
+        log.error('OpenCode agent created but the channel wiring threw', {
+          messagingGroupId: context.row.messaging_group_id,
+          agentGroupId: agent.id,
+          err,
+        });
+      }
+      if (wired) {
+        await context.deliverText(`✅ OpenCode agent "${agent.name}" created with ${model.id} and connected.`);
+        return true;
+      }
+      // The clicked card has lost its buttons; re-offer them so the approver
+      // can retry against the same (now recorded) group, or cancel.
+      await offerConfirmation(
+        context,
+        agent.name,
+        model.id,
+        `⚠️ OpenCode agent "${agent.name}" was created but the channel could not be connected.`,
       );
       return true;
     }

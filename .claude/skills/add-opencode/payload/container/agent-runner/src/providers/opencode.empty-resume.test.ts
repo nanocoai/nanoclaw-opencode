@@ -82,6 +82,26 @@ function assistantReply(sessionID: string, text: string): Array<{ type: string; 
   ];
 }
 
+/**
+ * The turn OpenCode opens an assistant record for and then abandons: the
+ * envelope arrives, no part ever follows, and the session idles. This is the
+ * quiet idle the fallback exists for, so a bare envelope must not count as work.
+ */
+function bareAssistantEnvelope(
+  sessionID: string,
+  info: Record<string, unknown> = {},
+): Array<{ type: string; properties: Record<string, unknown> }> {
+  return [
+    { type: 'message.updated', properties: { info: { id: 'msg_user', role: 'user' } } },
+    {
+      type: 'message.part.updated',
+      properties: { part: { type: 'text', messageID: 'msg_user', text: 'hey' } },
+    },
+    { type: 'message.updated', properties: { info: { id: 'msg_asst', role: 'assistant', ...info } } },
+    { type: 'session.idle', properties: { sessionID } },
+  ];
+}
+
 function permissionOnly(sessionID: string): Array<{ type: string; properties: Record<string, unknown> }> {
   return [
     { type: 'permission.updated', properties: { id: 'perm_1', sessionID } },
@@ -92,9 +112,11 @@ function permissionOnly(sessionID: string): Array<{ type: string; properties: Re
 function createFakeRuntime(script: Array<Array<{ type: string; properties: Record<string, unknown> }>>): {
   runtime: { getRuntime: () => Promise<OpenCodeRuntimeHandle> };
   promptIds: string[];
+  promptBodies: Array<{ parts: unknown[] }>;
   created: string[];
 } {
   const promptIds: string[] = [];
+  const promptBodies: Array<{ parts: unknown[] }> = [];
   const created: string[] = [];
   let nextCreate = 0;
   const queue: Array<{ type: string; properties: Record<string, unknown> }> = [];
@@ -138,6 +160,7 @@ function createFakeRuntime(script: Array<Array<{ type: string; properties: Recor
         },
         async promptAsync(params) {
           promptIds.push(params.path.id);
+          promptBodies.push(params.body);
           const events = script[promptIds.length - 1];
           if (!events) throw new Error(`no scripted events for prompt #${promptIds.length}`);
           pushEvents(events);
@@ -149,6 +172,7 @@ function createFakeRuntime(script: Array<Array<{ type: string; properties: Recor
 
   return {
     promptIds,
+    promptBodies,
     created,
     runtime: { getRuntime: async () => handle },
   };
@@ -306,6 +330,72 @@ describe('OpenCodeProvider empty-resume fallback', () => {
     await collect(query.events);
 
     expect(fake.created).toEqual(['ses_fresh_1']);
+  });
+
+  it('an assistant envelope that produced no part does not count as work', async () => {
+    const fake = createFakeRuntime([bareAssistantEnvelope('ses_stale'), assistantReply('ses_fresh_1', 'recovered')]);
+    const provider = new OpenCodeProvider({}, fake.runtime);
+    provider.registerMemorySessionHook(MEMORY_HOOK);
+    const query = provider.query({ prompt: 'hey', cwd: dir, continuation: 'ses_stale' });
+    const done = collect(query.events);
+    query.end();
+    const events = await done;
+
+    expect(fake.created).toEqual(['ses_fresh_1']);
+    expect(fake.promptIds).toEqual(['ses_stale', 'ses_fresh_1']);
+    expect(events.filter((e) => e.type === 'result')).toEqual([{ type: 'result', text: 'recovered' }]);
+  });
+
+  it('keeps a resume whose assistant message carries a provider error', async () => {
+    const fake = createFakeRuntime([
+      bareAssistantEnvelope('ses_stale', { error: { name: 'ProviderAuthError', data: { message: 'nope' } } }),
+    ]);
+    const provider = new OpenCodeProvider({}, fake.runtime);
+    provider.registerMemorySessionHook(MEMORY_HOOK);
+    const query = provider.query({ prompt: 'hey', cwd: dir, continuation: 'ses_stale' });
+    const done = collect(query.events);
+    query.end();
+    await done;
+
+    // An errored turn is a live session, not a dead continuation: rotating it
+    // would drop the history and hide the error behind a replay.
+    expect(fake.created).toEqual([]);
+    expect(fake.promptIds).toEqual(['ses_stale']);
+  });
+
+  it('replays with the prompt shape a first-time session would have received', async () => {
+    const memoryHook: OpenCodeMemorySessionHook = { ...MEMORY_HOOK, command: 'echo MEMORY_BLOCK' };
+    const resumed = createFakeRuntime([userIdle('ses_stale'), assistantReply('ses_fresh_1', 'recovered')]);
+    const resumedProvider = new OpenCodeProvider({}, resumed.runtime);
+    resumedProvider.registerMemorySessionHook(memoryHook);
+    const resumedQuery = resumedProvider.query({
+      prompt: 'hey',
+      cwd: dir,
+      continuation: 'ses_stale',
+      systemContext: { instructions: 'SYS_INSTR' },
+    });
+    const resumedDone = collect(resumedQuery.events);
+    resumedQuery.end();
+    await resumedDone;
+
+    const fresh = createFakeRuntime([assistantReply('ses_fresh_1', 'hi')]);
+    const freshProvider = new OpenCodeProvider({}, fresh.runtime);
+    freshProvider.registerMemorySessionHook(memoryHook);
+    const freshQuery = freshProvider.query({
+      prompt: 'hey',
+      cwd: dir,
+      systemContext: { instructions: 'SYS_INSTR' },
+    });
+    const freshDone = collect(freshQuery.events);
+    freshQuery.end();
+    await freshDone;
+
+    // One <system> block carrying memory then the instructions — byte-identical
+    // to the opening prompt of a query that never resumed anything.
+    expect(resumed.promptBodies[1]).toEqual(fresh.promptBodies[0]);
+    expect((resumed.promptBodies[1].parts[0] as { text: string }).text).toBe(
+      '<system>\nMEMORY_BLOCK\n\nSYS_INSTR\n</system>\n\nhey',
+    );
   });
 
   it('ignores foreign assistant events on the shared stream', async () => {

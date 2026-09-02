@@ -93,7 +93,7 @@ export async function pendingTextInputFor(approverUserId: string): Promise<strin
   const row = await getDb().get<{ messaging_group_id: string }>(
     `SELECT messaging_group_id FROM opencode_channel_provisioning
       WHERE approver_user_id = ? AND (
-        step IN ('awaiting_name', 'awaiting_model_query')
+        step IN ('awaiting_name', 'awaiting_model_query', 'awaiting_confirmation')
         OR (step = 'awaiting_provider' AND provider_id IN (
           '__catalog_search__', '__catalog_search_explicit__', '__inline_local_url__'
         ))
@@ -112,7 +112,8 @@ export async function beginState(messagingGroupId: string, approverUserId: strin
      VALUES (?, ?, 'awaiting_name', NULL, NULL, NULL, ?, ?)
      ON CONFLICT (messaging_group_id) DO UPDATE SET
        approver_user_id = excluded.approver_user_id, step = 'awaiting_name',
-       agent_name = NULL, provider_id = NULL, model_id = NULL, updated_at = excluded.updated_at`,
+       agent_name = NULL, provider_id = NULL, model_id = NULL, agent_group_id = NULL,
+       updated_at = excluded.updated_at`,
     messagingGroupId,
     approverUserId,
     now,
@@ -122,16 +123,24 @@ export async function beginState(messagingGroupId: string, approverUserId: strin
 
 export async function updateState(
   messagingGroupId: string,
-  values: { step: ProvisioningStep; agentName?: string | null; providerId?: string | null; modelId?: string | null },
+  values: {
+    step: ProvisioningStep;
+    agentName?: string | null;
+    providerId?: string | null;
+    modelId?: string | null;
+    /** Set once by the confirmation step; sticky until beginState resets the row. */
+    agentGroupId?: string | null;
+  },
 ): Promise<void> {
   await getDb().run(
     `UPDATE opencode_channel_provisioning SET
        step = ?, agent_name = COALESCE(?, agent_name), provider_id = COALESCE(?, provider_id),
-       model_id = ?, updated_at = ? WHERE messaging_group_id = ?`,
+       model_id = ?, agent_group_id = COALESCE(?, agent_group_id), updated_at = ? WHERE messaging_group_id = ?`,
     values.step,
     values.agentName ?? null,
     values.providerId ?? null,
     values.modelId ?? null,
+    values.agentGroupId ?? null,
     new Date().toISOString(),
     messagingGroupId,
   );

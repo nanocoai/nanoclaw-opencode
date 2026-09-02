@@ -91,7 +91,7 @@ import {
 import { upsertUser } from '../permissions/db/users.js';
 import { grantRole } from '../permissions/db/user-roles.js';
 import { getProvider, persistProviderSettings, syncEnvironmentProvider } from './db.js';
-import { opencodeChannelProvisioningMigration } from './migration.js';
+import { opencodeChannelProvisioningMigration, opencodeChannelProvisioningResumeMigration } from './migration.js';
 import './index.js';
 
 const now = () => new Date().toISOString();
@@ -137,6 +137,12 @@ describe('OpenCode channel-created agent provisioning', () => {
   it('can adopt the tables and provider_settings column left by the first-class implementation', async () => {
     if (opencodeChannelProvisioningMigration.sqliteOnly) throw new Error('expected a portable migration');
     await expect(opencodeChannelProvisioningMigration.up(getDb())).resolves.toBeUndefined();
+  });
+
+  it('the resume column migration is additive and idempotent on a DB that already has it', async () => {
+    if (opencodeChannelProvisioningResumeMigration.sqliteOnly) throw new Error('expected a portable migration');
+    await expect(opencodeChannelProvisioningResumeMigration.up(getDb())).resolves.toBeUndefined();
+    expect(await getDb().columnOwners?.('agent_group_id')).toContain('opencode_channel_provisioning');
   });
 
   it('snapshots ChatGPT auth only onto the environment-default connection', async () => {
@@ -491,6 +497,219 @@ describe('OpenCode channel-created agent provisioning', () => {
     expect(JSON.parse(config!.provider_settings!)).toMatchObject({
       opencode: { modelProvider: 'openrouter', baseUrl: null },
     });
+  });
+
+  it('a confirmation retried after the wiring did not land resumes the group it already created', async () => {
+    const row = (await getDb().get<PendingChannelApproval>(
+      'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
+      'origin',
+    ))!;
+    const texts: string[] = [];
+    const cards: Array<{ title: string; question: string; options: Array<{ value?: string }> }> = [];
+    const wiredGroups: string[] = [];
+    let created = 0;
+    // The first confirmation's wiring throws (the atomic wiring transaction
+    // rolled back), the second returns false; the approval row and the wizard
+    // state survive both, and the approver retries.
+    let wiring: 'throws' | 'false' | 'lands' = 'throws';
+    const context: ChannelAgentProvisioningContext = {
+      row,
+      isApproverDm: async (event) =>
+        event.channelType === 'fixture' &&
+        (event.instance ?? event.channelType) === 'fixture' &&
+        event.platformId === 'owner-dm',
+      deliverQuestion: async (title, question, options) => {
+        cards.push({ title, question, options: options as Array<{ value?: string }> });
+        return true;
+      },
+      deliverText: async (text) => void texts.push(text),
+      createAgent: async ({ name, provider, model }) => {
+        created += 1;
+        const id = `resume-created-${created}`;
+        await createAgentGroup({ id, name, folder: id, agent_provider: null, created_at: now() });
+        await ensureContainerConfig(id, provider);
+        await updateContainerConfigScalars(id, { provider, model });
+        return (await getDb().get('SELECT * FROM agent_groups WHERE id = ?', id))!;
+      },
+      wireAgent: async (agentGroupId) => {
+        wiredGroups.push(agentGroupId);
+        if (wiring === 'throws') throw new Error('wiring transaction rolled back');
+        return wiring === 'lands';
+      },
+      cancel: async () => {},
+    };
+    const confirmCard = (card: (typeof cards)[number] | undefined) =>
+      card?.options.map((option) => option.value).sort() ?? [];
+    const textEvent = (id: string, text: string) => ({
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      message: { id, kind: 'chat-sdk' as const, content: JSON.stringify({ text }), timestamp: now() },
+    });
+    const provisioner = getChannelAgentProvisioner('opencode')!;
+    const response = (value: string) => ({
+      questionId: 'origin',
+      value,
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      userId: 'owner',
+    });
+
+    await provisioner.start(context);
+    await provisioner.handleText(
+      context,
+      {
+        channelType: 'fixture',
+        platformId: 'owner-dm',
+        threadId: null,
+        message: {
+          id: 'name-resume',
+          kind: 'chat-sdk',
+          content: JSON.stringify({ text: 'Resumed Agent' }),
+          timestamp: now(),
+        },
+      },
+      'fixture:owner',
+    );
+    await provisioner.handleResponse(context, response('opencode_provider:local'));
+    await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
+    expect(
+      await getDb().get(
+        'SELECT agent_group_id FROM opencode_channel_provisioning WHERE messaging_group_id = ?',
+        'origin',
+      ),
+    ).toEqual({ agent_group_id: null });
+
+    expect(confirmCard(cards.at(-1))).toEqual(['opencode_cancel_agent', 'opencode_confirm_agent']);
+    const cardsBeforeConfirm = cards.length;
+
+    // A wiring that throws is contained: the click handler resolves, the
+    // created identity is durable, and — because a clicked card has lost its
+    // buttons on Chat SDK channels — a fresh confirmation card is delivered.
+    await expect(provisioner.handleResponse(context, response('opencode_confirm_agent'))).resolves.toBe(true);
+    expect(created).toBe(1);
+    expect(cards).toHaveLength(cardsBeforeConfirm + 1);
+    expect(cards.at(-1)?.question).toContain('could not be connected');
+    expect(confirmCard(cards.at(-1))).toEqual(['opencode_cancel_agent', 'opencode_confirm_agent']);
+    expect(
+      await getDb().get(
+        'SELECT step, model_id, agent_group_id FROM opencode_channel_provisioning WHERE messaging_group_id = ?',
+        'origin',
+      ),
+    ).toEqual({
+      step: 'awaiting_confirmation',
+      model_id: 'openai/selected-live-model',
+      agent_group_id: 'resume-created-1',
+    });
+
+    // Any reply in the approver's DM while confirmation is pending brings the
+    // buttons back (and is consumed by the wizard, not routed onward).
+    expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
+    await expect(provisioner.handleText(context, textEvent('nudge', 'hello?'), 'fixture:owner')).resolves.toBe(true);
+    expect(cards).toHaveLength(cardsBeforeConfirm + 2);
+    expect(confirmCard(cards.at(-1))).toEqual(['opencode_cancel_agent', 'opencode_confirm_agent']);
+    expect(created).toBe(1);
+
+    // A wiring that reports failure re-offers the card the same way.
+    wiring = 'false';
+    await provisioner.handleResponse(context, response('opencode_confirm_agent'));
+    expect(created).toBe(1);
+    expect(cards).toHaveLength(cardsBeforeConfirm + 3);
+    expect(cards.at(-1)?.question).toContain('could not be connected');
+
+    // The retry (a fresh host start reads the same durable row): no second
+    // agent group, every attempt targeted the group from the first click.
+    wiring = 'lands';
+    await provisioner.handleResponse(context, response('opencode_confirm_agent'));
+    expect(created).toBe(1);
+    expect(wiredGroups).toEqual(['resume-created-1', 'resume-created-1', 'resume-created-1']);
+    expect(cards).toHaveLength(cardsBeforeConfirm + 3);
+    expect(texts.at(-1)).toContain('connected');
+    expect(await getContainerConfig('resume-created-1')).toMatchObject({ model: 'openai/selected-live-model' });
+    expect(await getDb().get('SELECT 1 AS x FROM agent_groups WHERE id = ?', 'resume-created-2')).toBeUndefined();
+
+    // A wizard restarted on the same channel starts from nothing again.
+    await provisioner.start(context);
+    expect(
+      await getDb().get(
+        'SELECT agent_group_id FROM opencode_channel_provisioning WHERE messaging_group_id = ?',
+        'origin',
+      ),
+    ).toEqual({ agent_group_id: null });
+  });
+
+  it('a reply in the approver DM while confirmation is pending re-sends the confirmation card', async () => {
+    const row = (await getDb().get<PendingChannelApproval>(
+      'SELECT * FROM pending_channel_approvals WHERE messaging_group_id = ?',
+      'origin',
+    ))!;
+    const cards: Array<{ title: string; options: Array<{ value?: string }> }> = [];
+    let created = 0;
+    const context: ChannelAgentProvisioningContext = {
+      row,
+      isApproverDm: async (event) =>
+        event.channelType === 'fixture' &&
+        (event.instance ?? event.channelType) === 'fixture' &&
+        event.platformId === 'owner-dm',
+      deliverQuestion: async (title, _question, options) => {
+        cards.push({ title, options: options as Array<{ value?: string }> });
+        return true;
+      },
+      deliverText: async () => {},
+      createAgent: async () => {
+        created += 1;
+        throw new Error('must not create ahead of confirmation');
+      },
+      wireAgent: async () => true,
+      cancel: async () => {},
+    };
+    const provisioner = getChannelAgentProvisioner('opencode')!;
+    const response = (value: string) => ({
+      questionId: 'origin',
+      value,
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      userId: 'owner',
+    });
+    const textEvent = (id: string, text: string) => ({
+      channelType: 'fixture',
+      platformId: 'owner-dm',
+      threadId: null,
+      message: { id, kind: 'chat-sdk' as const, content: JSON.stringify({ text }), timestamp: now() },
+    });
+
+    await provisioner.start(context);
+    await provisioner.handleText(context, textEvent('name-pending', 'Pending Agent'), 'fixture:owner');
+    await provisioner.handleResponse(context, response('opencode_provider:local'));
+    await provisioner.handleResponse(context, response('opencode_model:openai%2Fselected-live-model'));
+    expect(cards.at(-1)?.title).toContain('Confirm');
+    const confirmCards = cards.length;
+
+    // The wizard still owns the approver's DM text at this step (the
+    // interceptor asks pendingTextInputFor before handing text to it).
+    expect(await provisioner.pendingTextInputFor('fixture:owner')).toBe('origin');
+    await expect(provisioner.handleText(context, textEvent('nudge', 'are you there?'), 'fixture:owner')).resolves.toBe(
+      true,
+    );
+    expect(cards).toHaveLength(confirmCards + 1);
+    expect(
+      cards
+        .at(-1)
+        ?.options.map((option) => option.value)
+        .sort(),
+    ).toEqual(['opencode_cancel_agent', 'opencode_confirm_agent']);
+    expect(created).toBe(0);
+    // A reply from another surface is not the approver's DM and stays unclaimed.
+    await expect(
+      provisioner.handleText(
+        context,
+        { ...textEvent('elsewhere', 'hi'), platformId: 'different-surface' },
+        'fixture:owner',
+      ),
+    ).resolves.toBe(false);
+    expect(cards).toHaveLength(confirmCards + 1);
   });
 
   it('keeps inline local endpoint input durable and snapshots it into the new group', async () => {
