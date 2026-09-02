@@ -3,7 +3,7 @@ import { lstatSync, realpathSync } from 'fs';
 import path from 'path';
 import { pathToFileURL } from 'url';
 
-import { createOpencodeClient, type FilePartInput, type OpencodeClient } from '@opencode-ai/sdk';
+import { createOpencodeClient, type FilePartInput } from '@opencode-ai/sdk';
 // The root client has no `.question` surface; reply/reject/list for the
 // interactive `question` tool live on the `/v2` subpath client. Import it
 // separately so the session/event client above is untouched.
@@ -19,6 +19,9 @@ import type {
   QueryInput,
 } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { buildDeliveryReminder } from '../compact-instructions.js';
+import type { DeliveryMode } from '../config.js';
+import { getTaskSeriesId } from '../db/session-routing.js';
 import { getAllDestinations } from '../destinations.js';
 
 function log(msg: string): void {
@@ -33,13 +36,40 @@ const MODEL_INPUT_MODALITIES = ['text', 'audio', 'image', 'video', 'pdf'] as con
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
+/**
+ * In-turn watchdog defaults (see the two tiers in `query()`). Env overrides:
+ * `OPENCODE_STREAM_SILENCE_MS` and `OPENCODE_IDLE_TIMEOUT_MS`. The server
+ * heartbeats every 10 s, so 60 s of total silence is six missed beats; the
+ * activity budget is generous because a single tool call (a long build, a
+ * browser session) legitimately streams nothing for many minutes.
+ */
+const DEFAULT_STREAM_SILENCE_MS = 60_000;
+const DEFAULT_IDLE_TIMEOUT_MS = 900_000;
+
 const AGENT_DIR = '/workspace/agent';
 const DEFAULT_NATIVE_ATTACHMENT_MAX_COUNT = 8;
 const DEFAULT_NATIVE_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 
-/** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
-const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
+/**
+ * The one signal that a stored continuation names a session the OpenCode
+ * server no longer has. The server's session lookup fails with its
+ * `NotFoundError` (`{ name: "NotFoundError", data: { message: "Session not
+ * found: <id>" } }`, HTTP 404 — @opencode-ai/sdk types.gen.d.ts
+ * `SessionPromptAsyncErrors[404]`), and the SDK's result tuple hands that body
+ * back unchanged, so it reaches the poll-loop JSON-stringified inside the
+ * `OpenCode promptAsync:` / `failed to create session:` errors thrown below.
+ *
+ * Deliberately NOT matched: bare `404`, `connection reset`, `ECONNRESET`, or
+ * the watchdog's `event timeout`. Those describe the model backend, the local
+ * proxy, or this process's SSE stream — the on-disk session is intact and the
+ * next turn should resume it. A `session.error` event can only carry
+ * `ProviderAuthError | UnknownError | MessageOutputLengthError |
+ * MessageAbortedError | ApiError` (never `NotFoundError`), and
+ * `sessionErrorMessage` forwards just its `data.message`, so a backend reply
+ * such as "404 No endpoints found" never reaches this predicate as a stale
+ * session. Same posture as the Claude provider's narrow `STALE_SESSION_RE`.
+ */
+const STALE_SESSION_RE = /"name":"NotFoundError"/;
 
 /**
  * Codex `startOrResumeCodexThread` starts a fresh thread when `thread/resume`
@@ -59,15 +89,20 @@ export function isEmptyOpenCodeResume(opts: {
 }
 
 function killProcessTree(proc: ChildProcess): void {
-  if (!proc.pid) return;
-  try {
-    process.kill(-proc.pid, 'SIGKILL');
-  } catch {
+  if (proc.pid) {
     try {
-      proc.kill('SIGKILL');
+      process.kill(-proc.pid, 'SIGKILL');
+      return;
     } catch {
-      /* ignore */
+      /* fall through to the single-process kill */
     }
+  }
+  // No pid (spawn never produced one) or the group signal failed: best-effort
+  // on the handle itself. A ChildProcess without a pid returns false here.
+  try {
+    proc.kill('SIGKILL');
+  } catch {
+    /* ignore */
   }
 }
 
@@ -474,13 +509,85 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
   };
 }
 
+type OpenCodeEvent = { type: string; properties: Record<string, unknown> };
+
+/**
+ * The client surface a shared runtime is built from: the per-turn session
+ * calls `OpenCodeRuntimeHandle` already narrows, plus the event subscription
+ * that only the shared (production) path opens. The real `OpencodeClient`
+ * satisfies it structurally; tests hand in a fake.
+ */
+/**
+ * The subset of the SDK's SSE options this module drives. `subscribe` spreads
+ * them through `get.sse` → `beforeRequest` → `createSseClient` (verified in
+ * @opencode-ai/sdk 1.18.25 dist/gen). Without a `signal`, that client swallows
+ * a closed socket and reconnects forever with backoff, so a killed server
+ * never ends the stream and an in-flight turn never learns it died.
+ */
+export interface SseSubscribeOptions {
+  signal?: AbortSignal;
+  sseSleepFn?: (ms: number) => Promise<void>;
+}
+
+type SharedRuntimeClient = OpenCodeRuntimeHandle['client'] & {
+  event: { subscribe(options?: SseSubscribeOptions): Promise<{ stream: AsyncGenerator<OpenCodeEvent, void, void> }> };
+};
+
+
+/** The SDK's retry backoff, made to return the moment the runtime is released. */
+function abortableSleep(signal: AbortSignal): (ms: number) => Promise<void> {
+  return (ms) =>
+    new Promise<void>((resolve) => {
+      if (signal.aborted) return resolve();
+      const timer = setTimeout(done, ms);
+      function done(): void {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', done);
+        resolve();
+      }
+      signal.addEventListener('abort', done, { once: true });
+    });
+}
+
 type SharedRuntime = {
   proc: ChildProcess;
-  client: OpencodeClient;
+  client: SharedRuntimeClient;
   questionClient: QuestionClient;
-  stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+  stream: AsyncGenerator<OpenCodeEvent, void, void>;
   streamRelease: () => void;
 };
+
+/**
+ * What `ensureSharedRuntime` needs from the outside world, injectable so the
+ * shared-server lifecycle (spawn failure, init failure after spawn, server
+ * death, stream death) can be driven in tests without an `opencode serve`
+ * process. `OpenCodeRuntimeDeps` on the provider bypasses this whole path;
+ * this seam exercises it.
+ */
+export interface OpenCodeSharedRuntimeDeps {
+  spawnServer(config: Record<string, unknown>): Promise<{ url: string; proc: ChildProcess }>;
+  createClient(url: string, cwd: string): SharedRuntimeClient;
+  createQuestionClient(url: string): QuestionClient;
+}
+
+const defaultSharedRuntimeDeps: OpenCodeSharedRuntimeDeps = {
+  spawnServer: (config) => spawnOpencodeServer(config),
+  // OpenCode scopes sessions and tool execution by the directory carried by
+  // the SDK client. The server process cwd is not sufficient: without this
+  // option the SDK defaults requests to the server's launch directory.
+  // The cast bridges one declared gap: the handle types `promptAsync` parts as
+  // `unknown[]` so fakes stay light, while the SDK types them as its part
+  // union. Every call site passes `buildPromptParts` output, which is the
+  // SDK's own union, so the runtime shapes agree.
+  createClient: (url, cwd) => createOpencodeClient({ baseUrl: url, directory: cwd }) as unknown as SharedRuntimeClient,
+  createQuestionClient: (url) => createOpencodeQuestionClient({ baseUrl: url }),
+};
+
+let sharedRuntimeDeps: OpenCodeSharedRuntimeDeps = defaultSharedRuntimeDeps;
+
+export function setSharedRuntimeDepsForTesting(deps?: OpenCodeSharedRuntimeDeps): void {
+  sharedRuntimeDeps = deps ?? defaultSharedRuntimeDeps;
+}
 
 let sharedRuntime: SharedRuntime | null = null;
 let sharedConfigKey: string | null = null;
@@ -496,43 +603,103 @@ function runtimeConfigKey(options: ProviderOptions, cwd: string): string {
   });
 }
 
+/**
+ * One `opencode serve` per container, reused across queries. Every failure
+ * mode leaves the module in a state the NEXT call can recover from: a failed
+ * init is never cached (so a slow listen line or a stolen port costs one turn,
+ * not the container's lifetime), a spawned server whose client setup fails is
+ * reaped rather than orphaned on its port, and a server that exits out from
+ * under us drops itself from the cache so the next turn respawns instead of
+ * failing instantly forever.
+ */
 async function ensureSharedRuntime(options: ProviderOptions, cwd: string): Promise<SharedRuntime> {
   const key = runtimeConfigKey(options, cwd);
   if (sharedRuntime && sharedConfigKey === key) return sharedRuntime;
 
   if (sharedInit) return sharedInit;
 
-  sharedInit = (async () => {
+  const deps = sharedRuntimeDeps;
+  const init = (async (): Promise<SharedRuntime> => {
     if (sharedRuntime) {
       destroySharedRuntime();
     }
     const config = buildOpenCodeConfig(options);
-    const { url, proc } = await spawnOpencodeServer(config);
-    // OpenCode scopes sessions and tool execution by the directory carried by
-    // the SDK client. The server process cwd is not sufficient: without this
-    // option the SDK defaults requests to the server's launch directory.
-    const client = createOpencodeClient({ baseUrl: url, directory: cwd });
-    const questionClient = createOpencodeQuestionClient({ baseUrl: url });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    // Belt-and-suspenders drain before this runtime serves any turn — see
-    // drainPendingQuestions doc comment.
-    await drainPendingQuestions(questionClient);
-    sharedRuntime = {
-      proc,
-      client,
-      questionClient,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
-      },
+    const { url, proc } = await deps.spawnServer(config);
+
+    let runtime: SharedRuntime;
+    // Owns the SSE subscription. Aborting it is the one thing that reliably
+    // wakes a `stream.next()` parked on a dead or wedged server: the SDK
+    // cancels its reader, skips the backoff (abortableSleep), sees the aborted
+    // signal at its loop top and returns — the generator yields `done` and
+    // the in-flight turn throws its stream-ended error.
+    const streamAbort = new AbortController();
+    try {
+      const client = deps.createClient(url, cwd);
+      const questionClient = deps.createQuestionClient(url);
+      // Deliberately no `sseMaxRetryAttempts`: the SDK counts attempts
+      // cumulatively per subscription and never resets after a successful
+      // reconnect, so a cap would end a long-lived container's stream for
+      // good on the Nth transient /event hiccup. The abort signal (server
+      // exit, teardown) and the stream-silence watchdog are the stops.
+      const sub = await client.event.subscribe({
+        signal: streamAbort.signal,
+        sseSleepFn: abortableSleep(streamAbort.signal),
+      });
+      const stream = sub.stream;
+      // Belt-and-suspenders drain before this runtime serves any turn — see
+      // drainPendingQuestions doc comment.
+      await drainPendingQuestions(questionClient);
+      runtime = {
+        proc,
+        client,
+        questionClient,
+        stream,
+        streamRelease: () => {
+          streamAbort.abort();
+          void stream.return?.(undefined);
+        },
+      };
+    } catch (err) {
+      // The server came up and is holding its port; nothing downstream will
+      // ever hold a handle to it, so this is the only place it can be reaped.
+      streamAbort.abort();
+      killProcessTree(proc);
+      throw err;
+    }
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (sharedRuntime?.proc !== proc) return;
+      log(`OpenCode server exited (code=${String(code)}, signal=${String(signal)}); next turn will respawn it`);
+      try {
+        runtime.streamRelease();
+      } catch {
+        /* ignore */
+      }
+      sharedRuntime = null;
+      sharedConfigKey = null;
     };
+    proc.once('exit', onExit);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      // Died between the listen line and the listener — the event is gone.
+      try {
+        runtime.streamRelease();
+      } catch {
+        /* ignore */
+      }
+      throw new Error(`OpenCode server exited during startup (code=${String(proc.exitCode)})`);
+    }
+
+    sharedRuntime = runtime;
     sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
+    return runtime;
   })();
 
-  return sharedInit;
+  sharedInit = init;
+  const release = (): void => {
+    if (sharedInit === init) sharedInit = null;
+  };
+  init.then(release, release);
+  return init;
 }
 
 export function destroySharedRuntime(): void {
@@ -547,6 +714,18 @@ export function destroySharedRuntime(): void {
     sharedConfigKey = null;
   }
   sharedInit = null;
+}
+
+/**
+ * The shared runtime's event stream died under a turn (SSE ended or threw).
+ * Only the shared runtime is dropped, and only if `rt` is still it — a
+ * test-injected handle or a runtime that was already replaced is untouched.
+ */
+function discardDeadSharedRuntime(rt: unknown): void {
+  if (sharedRuntime && rt === sharedRuntime) {
+    log('OpenCode event stream died; dropping shared runtime so the next turn respawns it');
+    destroySharedRuntime();
+  }
 }
 
 function sessionErrorMessage(props: { error?: unknown }): string {
@@ -566,27 +745,40 @@ export const QUESTION_STEERING_TEXT =
   'Interactive questions are not available in this environment. Decide autonomously based on your best judgment, or use the ask_user_question MCP tool to ask the human through the chat channel.';
 
 /**
- * Routing-discipline reminder injected on the first prompt AFTER OpenCode
+ * Delivery-discipline reminder injected on the first prompt AFTER OpenCode
  * auto-compacts the active session. Compaction rewrites the transcript into a
- * summary, and the delivery contract — every reply that should reach a human
- * must be wrapped in <message to="name">…</message> blocks, which the poll-loop
- * enforces when it dispatches the agent's final text — is exactly the kind of
- * standing instruction a summary can quietly drop. Once it is gone, replies
- * stop reaching anyone. Re-state it, with the live destination list, so the
- * next turn routes correctly.
+ * summary, and the delivery contract the poll-loop enforces — `envelope`:
+ * every reply that should reach a human is wrapped in <message to="name">…
+ * </message> blocks; `tools-only`: only outbound tool calls deliver and such
+ * blocks are inert scratchpad — is exactly the kind of standing instruction a
+ * summary can quietly drop. Once it is gone, replies stop reaching anyone (or
+ * cost a nudge round trip per compaction). Re-state it, with the live
+ * destination list, so the next turn delivers correctly.
+ *
+ * The wording is shared with the Claude PreCompact path
+ * (`buildDeliveryReminder` in compact-instructions.ts) so the two cannot
+ * drift; the mode comes from `ProviderOptions.deliveryMode`, i.e. the same
+ * container config the poll-loop reads.
  *
  * OpenCode 1.18.25 exposes no compaction-prompt/customInstructions config API,
  * so unlike the Claude provider's PreCompact hook we cannot steer the summary
  * itself. We re-inject on the next prompt instead. Destinations are read fresh
  * at injection time.
  */
-export function buildPostCompactionReminder(names: string[] = getAllDestinations().map((d) => d.name)): string {
-  const list = names.length > 0 ? names.map((n) => `\`${n}\``).join(', ') : '(none)';
+export function buildPostCompactionReminder(
+  names: string[] = getAllDestinations().map((d) => d.name),
+  deliveryMode: DeliveryMode = 'envelope',
+  // An isolated task session (`system:tasks:<id>` thread) is one-door
+  // regardless of mode: only send_message delivers and the final text becomes
+  // the run log. The caller reads it from session_routing at injection time
+  // (see the query() call site); the default keeps explicit-argument callers
+  // free of DB reads.
+  taskId: string | null = null,
+): string {
+  const contract = buildDeliveryReminder(names, taskId, deliveryMode).join(' ');
   return (
-    '<system>The conversation was just compacted into a summary. Routing instructions can be lost in ' +
-    'that summary, so as a reminder: wrap every reply you want delivered in ' +
-    '<message to="name">…</message> blocks — text outside such blocks is treated as scratchpad and is ' +
-    `NOT sent. Available destinations: ${list}.</system>`
+    '<system>The conversation was just compacted into a summary. Delivery instructions can be lost in ' +
+    `that summary, so as a reminder: ${contract}</system>`
   );
 }
 
@@ -752,6 +944,8 @@ export interface OpenCodeRuntimeHandle {
     session: {
       create(): Promise<{ data?: { id?: string }; error?: unknown }>;
       promptAsync(params: { path: { id: string }; body: { parts: unknown[] } }): Promise<{ error?: unknown }>;
+      /** `POST /session/{id}/abort` — stops one session, leaves the server up. */
+      abort?(params: { path: { id: string } }): Promise<{ error?: unknown }>;
     };
     postSessionIdPermissionsPermissionId?(params: {
       path: { id: string; permissionID: string };
@@ -760,6 +954,8 @@ export interface OpenCodeRuntimeHandle {
   };
   stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
   questionClient: QuestionClient;
+  /** Ends the event stream, waking any parked `stream.next()`. */
+  streamRelease?(): void;
 }
 
 export interface OpenCodeRuntimeDeps {
@@ -938,10 +1134,15 @@ export class OpenCodeProvider implements AgentProvider {
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
-    // Latch that re-injects the routing reminder on the next prompt after the
+    // Latch that re-injects the delivery reminder on the next prompt after the
     // active session auto-compacts (see createCompactionReminder). Per-query so
-    // it never leaks a pending reminder across independent query() calls.
-    const compaction = createCompactionReminder();
+    // it never leaks a pending reminder across independent query() calls. The
+    // reminder teaches the delivery contract this session actually runs under:
+    // the group's mode, or the one-door task contract when this is a task
+    // session — both read the same way the Claude PreCompact hook reads them.
+    const compaction = createCompactionReminder(() =>
+      buildPostCompactionReminder(undefined, this.options.deliveryMode, getTaskSeriesId()),
+    );
     // Memory rides the same two moments a context window is (re)built: this
     // opening prompt when it starts a new session, and the first prompt after
     // a compaction. Never on a resume, never on an ordinary push.
@@ -963,14 +1164,51 @@ export class OpenCodeProvider implements AgentProvider {
     };
 
     const self = this;
-    const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 300_000;
+    // Two watchdog tiers, both read at query() time:
+    //  - stream silence: no event of ANY kind (the server's 10 s
+    //    `server.heartbeat` included) for this long means the server is
+    //    wedged or its SSE connection is dead. The shared server is torn down
+    //    so the next turn respawns it.
+    //  - activity: no agent activity event for this long while the stream is
+    //    alive means the backend is wedged. Only that session is aborted; the
+    //    server stays. Generous by default so long tool runs survive.
+    // Bare positive integers only, like the attachment limits: a negative or
+    // fractional value would otherwise become a ~1 ms interval and trip the
+    // silence tier on every turn.
+    const STREAM_SILENCE_MS = positiveIntegerEnv('OPENCODE_STREAM_SILENCE_MS', DEFAULT_STREAM_SILENCE_MS);
+    const IDLE_TIMEOUT_MS = positiveIntegerEnv('OPENCODE_IDLE_TIMEOUT_MS', DEFAULT_IDLE_TIMEOUT_MS);
     let emptyResumeFellBack = false;
+    // The runtime the generator obtained, so abort() can reach the
+    // session-level abort. Unset until gen() runs — an abort before then has
+    // no prompt in flight to stop.
+    let runtimeHandle: Pick<OpenCodeRuntimeHandle, 'client'> | undefined;
+    // The session the generator currently has a prompt in flight on. Owned by
+    // the generator, not the instance-wide activeSessionId, so abort() targets
+    // exactly the turn it is interrupting.
+    let turnSessionInFlight: string | undefined;
+
+    // `POST /session/{id}/abort` — stop one session, keep the shared server.
+    // Fire-and-forget: the server answers with that session's own
+    // session.error / session.idle, which wakes a parked stream.next().
+    const abortSession = (id: string): void => {
+      const session = runtimeHandle?.client.session;
+      if (!session?.abort) return;
+      void session.abort({ path: { id } }).then(
+        (res) => {
+          if (res?.error) log(`Failed to abort session ${id}: ${JSON.stringify(res.error)}`);
+        },
+        (err: unknown) => {
+          log(`Failed to abort session ${id}: ${err instanceof Error ? err.message : String(err)}`);
+        },
+      );
+    };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
       const rt = self.runtime
         ? await self.runtime.getRuntime(self.options, input.cwd)
         : await ensureSharedRuntime(self.options, input.cwd);
+      runtimeHandle = rt;
       const { client, stream, questionClient } = rt;
 
       while (!aborted) {
@@ -989,6 +1227,12 @@ export class OpenCodeProvider implements AgentProvider {
 
         if (!sessionId) {
           const created = await client.session.create();
+          if (aborted) {
+            // abort() landed while create() was parked; it had no id to
+            // target, so the session it produced is ours to stop.
+            if (created.data?.id) abortSession(created.data.id);
+            return;
+          }
           if (created.error) {
             throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
           }
@@ -1007,10 +1251,20 @@ export class OpenCodeProvider implements AgentProvider {
           turnText: string,
           turnAttachments: typeof attachments,
         ): AsyncGenerator<ProviderEvent, { resultText: string; sawAssistantWork: boolean }> {
+          const empty = { resultText: '', sawAssistantWork: false };
+          if (aborted) return empty;
+          turnSessionInFlight = turnSessionId;
           const promptRes = await client.session.promptAsync({
             path: { id: turnSessionId },
             body: { parts: buildPromptParts(turnText, turnAttachments) },
           });
+          if (aborted) {
+            // abort() landed while the prompt was still registering; an abort
+            // it sent may have preceded the prompt server-side, so stop the
+            // session again now that the turn exists.
+            abortSession(turnSessionId);
+            return empty;
+          }
           if (promptRes.error) {
             self.activeSessionId = undefined;
             throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
@@ -1021,32 +1275,83 @@ export class OpenCodeProvider implements AgentProvider {
           const partMessageIds = new Set<string>();
           let sawAssistantWork = false;
           let lastEventAt = Date.now();
-          let eventTimedOut = false;
-          const timeoutCheck = setInterval(() => {
-            if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
-              log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${turnSessionId}`);
-              eventTimedOut = true;
-              self.activeSessionId = undefined;
-              destroySharedRuntime();
-              kick();
-            }
-          }, 5000);
+          let lastActivityAt = Date.now();
+          let streamSilent = false;
+          let activityTimedOut = false;
+          const silenceError = (): Error =>
+            new Error(`OpenCode event stream silent for ${STREAM_SILENCE_MS}ms; server dropped`);
+          const activityError = (): Error =>
+            new Error(`OpenCode turn produced no activity for ${IDLE_TIMEOUT_MS}ms; aborted`);
+          const timeoutCheck = setInterval(
+            () => {
+              const now = Date.now();
+              if (!streamSilent && now - lastEventAt > STREAM_SILENCE_MS) {
+                // Not even heartbeats: the server is gone or wedged. Genuine
+                // runtime death — the one case that tears the shared server
+                // down. Releasing the stream aborts the SSE subscription,
+                // which is what actually wakes the parked stream.next(); a
+                // SIGKILL alone does not (the SDK would reconnect forever).
+                // This tier has done its job: stop ticking.
+                clearInterval(timeoutCheck);
+                log(`OpenCode event stream silent for ${STREAM_SILENCE_MS}ms — dropping runtime, session ${turnSessionId}`);
+                streamSilent = true;
+                self.activeSessionId = undefined;
+                discardDeadSharedRuntime(rt);
+                try {
+                  rt.streamRelease?.();
+                } catch {
+                  /* ignore */
+                }
+                kick();
+              } else if (!activityTimedOut && now - lastActivityAt > IDLE_TIMEOUT_MS) {
+                // Stream alive, backend wedged: stop this session only. The
+                // server's reply for the aborted session wakes stream.next().
+                log(`OpenCode turn produced no activity for ${IDLE_TIMEOUT_MS}ms — aborting session ${turnSessionId}`);
+                activityTimedOut = true;
+                abortSession(turnSessionId);
+                kick();
+              }
+            },
+            Math.min(5000, STREAM_SILENCE_MS, IDLE_TIMEOUT_MS),
+          );
 
           try {
             turn: while (true) {
               if (aborted) return { resultText: '', sawAssistantWork };
-              if (eventTimedOut) {
-                throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
-              }
+              if (streamSilent) throw silenceError();
+              if (activityTimedOut) throw activityError();
 
-              const { value: ev, done } = await stream.next();
-              if (done) {
+              let next: IteratorResult<OpenCodeEvent, void>;
+              try {
+                next = await stream.next();
+              } catch (err) {
+                if (streamSilent) throw silenceError();
+                discardDeadSharedRuntime(rt);
+                throw new Error(`OpenCode SSE stream failed: ${err instanceof Error ? err.message : String(err)}`);
+              }
+              if (next.done) {
+                if (streamSilent) throw silenceError();
+                discardDeadSharedRuntime(rt);
                 throw new Error('OpenCode SSE stream ended unexpectedly');
               }
+              // An abort or watchdog lands while this await is parked;
+              // whatever woke it (the aborted session's own error/idle, or a
+              // heartbeat) is not this turn's to process.
+              if (aborted) return { resultText: '', sawAssistantWork };
+              if (streamSilent) throw silenceError();
+              if (activityTimedOut) throw activityError();
+              const ev = next.value;
 
-              if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
+              if (!ev?.type || ev.type === 'server.connected') continue;
+              if (ev.type === 'server.heartbeat') {
+                // Liveness only: not agent activity, so neither the activity
+                // tier nor the runner's own heartbeat is fed by it.
+                lastEventAt = Date.now();
+                continue;
+              }
 
               lastEventAt = Date.now();
+              lastActivityAt = lastEventAt;
               yield { type: 'activity' };
 
               switch (ev.type) {
@@ -1146,6 +1451,7 @@ export class OpenCodeProvider implements AgentProvider {
             }
           } finally {
             clearInterval(timeoutCheck);
+            turnSessionInFlight = undefined;
           }
 
           let resultText = '';
@@ -1172,7 +1478,10 @@ export class OpenCodeProvider implements AgentProvider {
           emptyResumeFellBack = true;
           self.activeSessionId = undefined;
           const created = await client.session.create();
-          if (aborted) return;
+          if (aborted) {
+            if (created.data?.id) abortSession(created.data.id);
+            return;
+          }
           if (created.error) {
             throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
           }
@@ -1215,7 +1524,13 @@ export class OpenCodeProvider implements AgentProvider {
         aborted = true;
         this.activeSessionId = undefined;
         kick();
-        destroySharedRuntime();
+        // Stop the session, not the server. `opencode serve` is shared by
+        // every query in this container, so a /clear or /compact must not cost
+        // a SIGKILL plus a respawn and its listen wait. Targets the turn the
+        // generator actually has in flight; a turn still parked in create()
+        // or promptAsync() re-checks `aborted` when it resumes and stops the
+        // session it just obtained.
+        if (turnSessionInFlight) abortSession(turnSessionInFlight);
       },
     };
   }

@@ -14,17 +14,27 @@ This reverses every persistent change made by `/add-opencode`.
    `src/modules/opencode-channel-provisioning/`.
 3. From `container/agent-runner`, run `bun remove @opencode-ai/sdk`.
 4. Delete the `opencode-ai` object from `container/cli-tools.json`.
-5. Remove OpenCode-only `.env` keys when unused: `OPENCODE_PROVIDER`,
-   `OPENCODE_MODEL`, `OPENCODE_SMALL_MODEL`, the three
-   `OPENCODE_MODEL_*` capability/limit keys, the two
-   `OPENCODE_NATIVE_ATTACHMENT_*` limit keys, and `ANTHROPIC_BASE_URL`.
-6. Switch every OpenCode group to an installed provider before rebuilding:
+5. Remove the `.env` keys setup wrote: `OPENCODE_PROVIDER`, `OPENCODE_MODEL`,
+   `OPENCODE_SMALL_MODEL`, `OPENCODE_AUTH_MODE` (ChatGPT backend only), and
+   `ANTHROPIC_BASE_URL` unless the Claude provider still uses it. Also drop
+   any operator-added overrides only OpenCode read: the three
+   `OPENCODE_MODEL_*` capability/limit keys and the two
+   `OPENCODE_NATIVE_ATTACHMENT_*` limit keys.
+6. Delete `data/opencode/openai-auth-stub.json`, the read-only
+   `onecli-managed` credential stub setup writes for the ChatGPT backend, and
+   the `data/opencode/` directory once it is empty.
+7. Delete the OneCLI secrets setup created, when nothing else uses them:
+   `OpenCode ChatGPT` (ChatGPT backend, host pattern `chatgpt.com`) and
+   `OpenCode <provider>` for API-key backends (for example
+   `OpenCode openrouter`). Run `onecli secrets list`, then
+   `onecli secrets delete --id <id>` for each.
+8. Switch every OpenCode group to an installed provider before rebuilding:
 
    ```bash
    ncl groups config update --id <group-id> --provider claude
    ```
 
-7. Rebuild the project and image, then restart NanoClaw.
+9. Rebuild the project and image, then restart NanoClaw.
 
 Session state remains under each session directory so removal does not silently
 destroy conversations or credentials. Delete it separately only when the

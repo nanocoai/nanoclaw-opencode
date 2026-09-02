@@ -199,7 +199,10 @@ describe('OpenCode channel-created agent provisioning', () => {
       ),
     ).toMatchObject({ ok: true });
     expect(
-      await dispatch({ id: 'x', command: 'opencode-model-providers-delete', args: { id: 'local' } }, { caller: 'host' }),
+      await dispatch(
+        { id: 'x', command: 'opencode-model-providers-delete', args: { id: 'local' } },
+        { caller: 'host' },
+      ),
     ).toMatchObject({ ok: true, data: { deleted: 'local' } });
     expect(
       await dispatch({ id: 'n', command: 'opencode-model-providers-delete', args: { id: 'nope' } }, { caller: 'host' }),
@@ -667,10 +670,7 @@ describe('OpenCode wizard hands core registration buttons back', () => {
     await click('connect:anchor');
 
     expect(
-      await getDb().get(
-        'SELECT agent_group_id FROM messaging_group_agents WHERE messaging_group_id = ?',
-        'origin',
-      ),
+      await getDb().get('SELECT agent_group_id FROM messaging_group_agents WHERE messaging_group_id = ?', 'origin'),
     ).toEqual({ agent_group_id: 'anchor' });
     expect(
       await getDb().get('SELECT 1 AS x FROM opencode_channel_provisioning WHERE messaging_group_id = ?', 'origin'),

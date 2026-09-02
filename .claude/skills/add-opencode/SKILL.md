@@ -31,10 +31,12 @@ payload/container/agent-runner/src/providers/opencode-registration.test.ts -> co
 payload/container/agent-runner/src/providers/opencode.attachments.test.ts -> container/agent-runner/src/providers/opencode.attachments.test.ts
 payload/container/agent-runner/src/providers/opencode.compaction.test.ts -> container/agent-runner/src/providers/opencode.compaction.test.ts
 payload/container/agent-runner/src/providers/opencode.config.test.ts -> container/agent-runner/src/providers/opencode.config.test.ts
+payload/container/agent-runner/src/providers/opencode.delivery-mode.test.ts -> container/agent-runner/src/providers/opencode.delivery-mode.test.ts
 payload/container/agent-runner/src/providers/opencode.empty-resume.test.ts -> container/agent-runner/src/providers/opencode.empty-resume.test.ts
 payload/container/agent-runner/src/providers/opencode.factory.test.ts -> container/agent-runner/src/providers/opencode.factory.test.ts
 payload/container/agent-runner/src/providers/opencode.memory.test.ts -> container/agent-runner/src/providers/opencode.memory.test.ts
 payload/container/agent-runner/src/providers/opencode.question.test.ts -> container/agent-runner/src/providers/opencode.question.test.ts
+payload/container/agent-runner/src/providers/opencode.shared-runtime.test.ts -> container/agent-runner/src/providers/opencode.shared-runtime.test.ts
 payload/setup/providers/opencode.ts -> setup/providers/opencode.ts
 payload/setup/providers/opencode.test.ts -> setup/providers/opencode.test.ts
 payload/setup/providers/opencode-registration.test.ts -> setup/providers/opencode-registration.test.ts
@@ -107,8 +109,16 @@ temporary directory is deleted. The runtime sees only a read-only
 `onecli-managed` stub. API keys are likewise stored in OneCLI;
 `.env` contains only provider, model, auth-mode, and optional base-URL configuration.
 On the next host start, the OpenCode module mirrors that non-secret backend
-configuration into an `Environment default` model-provider connection. Extra
-connections can be managed with `ncl opencode-model-providers`.
+configuration into an `Environment default` model-provider connection
+(id `environment-default`). That row is owned by `.env`: every host start
+re-applies `OPENCODE_PROVIDER`, `ANTHROPIC_BASE_URL` and the
+`OPENCODE_MODEL_*` limits to it and re-enables it, so
+`ncl opencode-model-providers update` and `delete` refuse it — change `.env`
+and restart instead, and unset `OPENCODE_PROVIDER` to disable it. If an
+operator connection already uses the `Environment default` name, the mirror
+row is named `Environment default (.env)`; if both names are taken the host
+logs a warning and starts without syncing it. Extra connections can be
+managed with `ncl opencode-model-providers`.
 
 ## Use it
 
@@ -130,7 +140,13 @@ not a required step. It requires explicit confirmation, then stores the chosen
 model and provider settings on that new group before the first container starts. Catalog providers
 expect their credentials to be available through OneCLI; secrets never enter
 the wizard state. The durable wizard row survives host restarts and works
-through every channel adapter using the generic approval flow.
+through every channel adapter using the generic approval flow; its prompts and
+cards go out through the adapter instance that delivered the registration
+card, so multi-instance installs (one bot per agent group) keep talking to the
+approver from the same bot. The registration card's own buttons stay live
+while the wizard runs: clicking **Connect to <agent>** (or a selection card's
+connect button) abandons the wizard, tells the approver so, and connects the
+existing agent instead. Replying `cancel` or clicking **Reject** also ends it.
 
 OpenCode runs in `/workspace/agent`, explicitly reads the composed
 `CLAUDE.md`, and keeps its SDK client scoped to that same directory. Session
