@@ -57,14 +57,30 @@ function seedSharedSession(): void {
   ).run(CHANNEL.channelType, CHANNEL.platformId);
 }
 
-function insertInbound(id: string, threadId: string, text: string): void {
+function insertInbound(
+  id: string,
+  threadId: string,
+  text: string,
+  opts: { trigger?: 0 | 1; seq?: number } = {},
+): void {
+  // `seq` is the host's even-numbered write order; the batch selector sorts
+  // on it, so tests that care about in-batch order must set it.
   getInboundDb()
     .prepare(
       `INSERT INTO messages_in
-       (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
-       VALUES (?, 'chat', ?, 'pending', 1, ?, ?, ?, ?)`,
+       (id, seq, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+       VALUES (?, ?, 'chat', ?, 'pending', ?, ?, ?, ?, ?)`,
     )
-    .run(id, new Date().toISOString(), CHANNEL.platformId, CHANNEL.channelType, threadId, JSON.stringify({ text }));
+    .run(
+      id,
+      opts.seq ?? null,
+      new Date().toISOString(),
+      opts.trigger ?? 1,
+      CHANNEL.platformId,
+      CHANNEL.channelType,
+      threadId,
+      JSON.stringify({ text }),
+    );
 }
 
 async function waitForPush(pushes: string[], marker: string): Promise<void> {
@@ -140,6 +156,255 @@ describe('tools-only reconciliation across a follow-up push', () => {
     expect(visibleTexts()).toEqual(['ALPHA', 'BETA']);
     expect(visibleRows()[1].in_reply_to).toBe('request-2');
     expect(visibleRows()[1].thread_id).toBeNull();
+  });
+
+  it('judges a follow-up only at its own result: an earlier turn ending must not nudge a request whose prompt is still queued', async () => {
+    // Live-observed (2026-09-02, tools-only group, shared Mattermost session):
+    // "say ALPHA" then "say BETA" 3 s later while ALPHA's turn was live. BETA
+    // was pushed as a follow-up; ALPHA's result then found BETA outstanding,
+    // judged it undelivered and queued the nudge. The provider ran BETA's
+    // prompt (one BETA sent), then the nudge — and the model sent BETA again.
+    const pushes: string[] = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'continuation-1' };
+      await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+      // BETA lands while ALPHA's turn is still live and is pushed behind it.
+      insertInbound('request-2', 'thread-2', 'second: say BETA');
+      await waitForPush(pushes, 'second: say BETA');
+      // ALPHA's turn ends. request-2's prompt has not run yet.
+      yield { type: 'result', text: 'sent alpha' };
+
+      // The provider now runs the queued BETA prompt.
+      await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+      yield { type: 'result', text: 'sent beta' };
+
+      // If a nudge was queued behind BETA, the model obeys it — that is the
+      // duplicate the user saw.
+      if (nudges(pushes).length > 0) {
+        await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+        yield { type: 'result', text: 'sent beta again' };
+      }
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(nudges(pushes)).toEqual([]);
+    expect(visibleTexts()).toEqual(['ALPHA', 'BETA']);
+    expect(visibleRows().map((row) => row.in_reply_to)).toEqual(['request-1', 'request-2']);
+  });
+
+  it('still nudges, then places the placeholder, for a queued follow-up once its own turn stays dry', async () => {
+    // Same shape as above, but BETA's own turn sends nothing: the nudge must
+    // fire at BETA's result (not ALPHA's), and the placeholder only at the
+    // nudge's own result.
+    const pushes: string[] = [];
+    const nudgeCountAtBetaTurn: number[] = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+      insertInbound('request-2', 'thread-2', 'second: say BETA');
+      await waitForPush(pushes, 'second: say BETA');
+      yield { type: 'result', text: 'sent alpha' };
+      nudgeCountAtBetaTurn.push(nudges(pushes).length);
+      // BETA's prompt runs dry.
+      yield { type: 'result', text: 'thought about beta' };
+      // The nudge's prompt runs dry too.
+      yield { type: 'result', text: 'still nothing' };
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(nudgeCountAtBetaTurn).toEqual([0]);
+    expect(nudges(pushes)).toHaveLength(1);
+    const rows = visibleRows();
+    expect(rows.map((row) => JSON.parse(row.content).text)).toEqual([
+      'ALPHA',
+      "I couldn't put a reply together for that one. Try asking again.",
+    ]);
+    expect(rows[1].in_reply_to).toBe('request-2');
+    expect(rows[1].thread_id).toBe('thread-2');
+  });
+
+  it('keeps the live turn stamped for its own request when a follow-up is pushed before the live turn sends', async () => {
+    // Reviewer probe A: BETA is pushed while ALPHA's turn is live and ALPHA's
+    // send_message lands AFTER the push. That send answers ALPHA; it must
+    // carry request-1, not the queued request-2, or leg 1 pays off BETA with
+    // it, ALPHA is judged dry, and the user sees ALPHA, BETA, ALPHA-again and
+    // a placeholder.
+    const pushes: string[] = [];
+    const stamps: Array<string | null> = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'continuation-1' };
+      insertInbound('request-2', 'thread-2', 'second: say BETA');
+      await waitForPush(pushes, 'second: say BETA');
+      stamps.push(getCurrentInReplyTo());
+      await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+      yield { type: 'result', text: 'sent alpha' };
+
+      // BETA's queued prompt runs.
+      stamps.push(getCurrentInReplyTo());
+      await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+      yield { type: 'result', text: 'sent beta' };
+
+      if (nudges(pushes).length > 0) {
+        await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+        yield { type: 'result', text: 'sent alpha again' };
+      }
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(stamps).toEqual(['request-1', 'request-2']);
+    expect(nudges(pushes)).toEqual([]);
+    expect(visibleTexts()).toEqual(['ALPHA', 'BETA']);
+    expect(visibleRows().map((row) => row.in_reply_to)).toEqual(['request-1', 'request-2']);
+  });
+
+  it('stamps the nudge turn for the request it retries, after a queued follow-up ran in between', async () => {
+    // Reviewer probe E: ALPHA's turn is dry, BETA is queued behind it and is
+    // answered on its own turn, then the model correctly sends ALPHA at the
+    // nudge. That send must carry request-1 so ALPHA's asker is paid off
+    // instead of getting the placeholder on top of the real reply.
+    const pushes: string[] = [];
+    const stamps: Array<string | null> = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      insertInbound('request-2', 'thread-2', 'second: say BETA');
+      await waitForPush(pushes, 'second: say BETA');
+      yield { type: 'result', text: 'thought about alpha' };
+
+      // BETA's queued prompt runs.
+      stamps.push(getCurrentInReplyTo());
+      await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+      yield { type: 'result', text: 'sent beta' };
+
+      // The nudge for ALPHA runs and the model obeys it.
+      stamps.push(getCurrentInReplyTo());
+      await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+      yield { type: 'result', text: 'sent alpha' };
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(nudges(pushes)).toHaveLength(1);
+    expect(stamps).toEqual(['request-2', 'request-1']);
+    expect(visibleTexts()).toEqual(['BETA', 'ALPHA']);
+    expect(visibleRows().map((row) => row.in_reply_to)).toEqual(['request-2', 'request-1']);
+  });
+
+  it('notices only the erroring exchange, not a follow-up whose prompt still runs afterwards', async () => {
+    // Claude-path shape: an isError result ends ALPHA's turn while BETA is
+    // queued behind it. BETA's prompt still runs and answers itself; it must
+    // not also get the error notice.
+    const pushes: string[] = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      insertInbound('request-2', 'thread-2', 'second: say BETA');
+      await waitForPush(pushes, 'second: say BETA');
+      yield { type: 'result', text: 'upstream failure detail', isError: true };
+
+      await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+      yield { type: 'result', text: 'sent beta' };
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(nudges(pushes)).toEqual([]);
+    expect(visibleTexts()).toEqual(["Something went wrong on my side and I couldn't finish that one.", 'BETA']);
+    expect(visibleRows().map((row) => row.in_reply_to)).toEqual(['request-1', 'request-2']);
+  });
+
+  it('stamps the engaging mention, not an accumulated context row, when a follow-up batch mixes both', async () => {
+    // Live-observed: a reply stamped with the first accumulated trigger=0
+    // row's id while the engaging mention was a later row.
+    const pushes: string[] = [];
+    const stampAtSend: Array<string | null> = [];
+    setCurrentInReplyTo('request-1');
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      await sendMessage.handler({ to: 'mattermost-test', text: 'ALPHA' });
+      yield { type: 'result', text: 'sent alpha' };
+      insertInbound('context-1', 'thread-2', 'ambient chatter', { trigger: 0, seq: 2 });
+      insertInbound('context-2', 'thread-2', 'more chatter', { trigger: 0, seq: 4 });
+      insertInbound('request-2', 'thread-2', '@agent second question', { seq: 6 });
+      await waitForPush(pushes, 'second question');
+      stampAtSend.push(getCurrentInReplyTo());
+      await sendMessage.handler({ to: 'mattermost-test', text: 'BETA' });
+      yield { type: 'result', text: 'sent beta' };
+    }
+
+    await processQuery(
+      queryOver(events(), pushes),
+      routingFor('request-1', 'thread-1'),
+      ['request-1'],
+      'mock',
+      undefined,
+      'prompt',
+      undefined,
+      false,
+      'tools-only',
+    );
+
+    expect(stampAtSend).toEqual(['request-2']);
+    expect(nudges(pushes)).toEqual([]);
+    expect(visibleRows().map((row) => row.in_reply_to)).toEqual(['request-1', 'request-2']);
   });
 
   it('re-points the tool stamp at each follow-up in envelope mode too', async () => {

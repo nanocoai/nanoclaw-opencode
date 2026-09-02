@@ -38,7 +38,13 @@ import {
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  PromptAttachment,
+  ProviderEvent,
+  ProviderExchange,
+} from './providers/types.js';
 import type { DeliveryMode } from './config.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -251,7 +257,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(queryRouting.inReplyTo);
+    setCurrentInReplyTo(toolStampFor(keep));
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -385,8 +391,35 @@ export async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
-  const outstanding: Array<{ target: ReplyTarget; nudged: boolean }> =
-    toolsOnly ? (routing.replyTargets ?? []).map((target) => ({ target, nudged: false })) : [];
+  // Exchange bookkeeping. Prompts enter the provider in push order and every
+  // 'result' event answers the oldest unanswered prompt, so a prompt's push
+  // ordinal identifies its exchange: the initial prompt is exchange 0, each
+  // query.push() (follow-up or nudge) takes the next ordinal, and the n-th
+  // result belongs to exchange n. A tools-only request is judged (nudge,
+  // placeholder) only at a result whose exchange is at or past the prompt
+  // that carried it — live-observed otherwise: a follow-up pushed while the
+  // previous turn was live was judged "undelivered" at THAT turn's result,
+  // before its own prompt had run, and the queued nudge made the model send
+  // the reply twice. Reconciliation (paying a request off) is not gated:
+  // a row stamped for a queued request settles it whenever it appears.
+  // `promptsPushed` only moves through pushPrompt() below, so the ordinal
+  // and the push can never drift apart.
+  let promptsPushed = 1;
+  let resultsSeen = 0;
+  // The inbound id each exchange's tool sends must carry (`current_in_reply_to`
+  // in session_state, read by send_message / send_file). Exchange 0 is what
+  // runPollLoop published before the query started. The stamp is handed to an
+  // exchange only when the provider actually starts running it: at push time
+  // if the provider is idle, otherwise at the result that ends the exchange
+  // ahead of it. Live-observed otherwise: a follow-up pushed during a live
+  // turn re-pointed the stamp at once, so a tool send the LIVE turn made
+  // after the push carried the queued request's id — the exact-stamp leg
+  // then paid off the queued request and the live one was never settled.
+  const exchangeStamps = new Map<number, string | null>([[0, stampForRouting(routing)]]);
+  const stampOf = (exchange: number): string | null => exchangeStamps.get(exchange) ?? null;
+  const outstanding: ToolsOnlyRequest[] = toolsOnly
+    ? (routing.replyTargets ?? []).map((target) => ({ target, nudged: false, exchange: 0 }))
+    : [];
   // Every human request this query has ever held as a reply target — still
   // open or already settled. Reconciliation uses it so a row stamped for a
   // request that was settled earlier in the query (a send_file after the
@@ -433,6 +466,63 @@ export async function processQuery(
   // the same prompt again. Unused (and unmaintained) when the provider
   // doesn't implement `onExchangeComplete`.
   const archivePrompts: string[] = [initialPrompt];
+
+  /**
+   * The one way a prompt enters the provider after the initial one. Takes
+   * the next exchange ordinal, records the stamp that exchange's tool sends
+   * must carry, and — only if the provider is idle, i.e. every pushed prompt
+   * already has its result — publishes that stamp now, because the provider
+   * starts this prompt immediately. When a turn is still live the stamp stays
+   * with the live exchange; the result handler hands it over once this
+   * prompt becomes current. Returns the ordinal.
+   */
+  function pushPrompt(text: string, stamp: string | null, attachments?: PromptAttachment[]): number {
+    const exchange = promptsPushed++;
+    exchangeStamps.set(exchange, stamp);
+    if (resultsSeen === exchange) setCurrentInReplyTo(stamp);
+    query.push(text, attachments);
+    return exchange;
+  }
+
+  /**
+   * Result-door judgment for a tools-only turn. Settles whatever the outbound
+   * DB shows delivered (every request, queued or not), then acts only on the
+   * requests this result's exchange has answered — `entry.exchange <=
+   * exchange`: a dry request that was already nudged gets the fixed
+   * placeholder; a dry request not yet nudged gets the nudge pushed once. A
+   * request whose prompt is still queued behind this result is left alone —
+   * its own result judges it. A pushed nudge takes the next exchange ordinal
+   * and re-homes the nudged requests onto it, so they are re-judged at the
+   * nudge's own result, not at a follow-up's result queued ahead of it.
+   */
+  async function judgeToolsOnlyTurn(
+    exchange: number,
+    nudge: string,
+  ): Promise<{ anyDelivered: boolean; retried: boolean }> {
+    const dueBefore = outstanding.filter((entry) => entry.exchange <= exchange).length;
+    lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
+    const due = outstanding.filter((entry) => entry.exchange <= exchange);
+    const anyDelivered = due.length < dueBefore;
+    const spent = due.filter((entry) => entry.nudged);
+    for (const { target } of spent) {
+      lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
+    }
+    if (spent.length > 0) {
+      const spentSet = new Set(spent);
+      outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !spentSet.has(entry)));
+    }
+    const dry = due.filter((entry) => !entry.nudged);
+    if (dry.length > 0) {
+      // The nudge's sends answer the dry request(s) — stamp the last one, the
+      // same "last triggering row" policy a batch uses (see toolStampFor).
+      const nudgeExchange = pushPrompt(nudge, dry[dry.length - 1].target.inReplyTo);
+      for (const entry of dry) {
+        entry.nudged = true;
+        entry.exchange = nudgeExchange;
+      }
+    }
+    return { anyDelivered, retried: dry.length > 0 };
+  }
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -522,22 +612,22 @@ export async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;
-        if (toolsOnly) {
-          for (const target of replyTargetsFor(keep)) outstanding.push({ target, nudged: false });
-        }
         // Re-point the outbound reply stamp at this follow-up, the same way
-        // the outer loop stamps a fresh batch: from here on the agent is
-        // answering it, so a `send_message` / `send_file` row must carry ITS
-        // id — tools-only reconciliation matches `in_reply_to` against the
+        // the outer loop stamps a fresh batch: once the agent is answering
+        // it, a `send_message` / `send_file` row must carry ITS id —
+        // tools-only reconciliation matches `in_reply_to` against the
         // follow-up's reply target, and the a2a return path resolves the
         // origin session from it. The envelope door already attributes a
         // block to the latest inbound row on its channel (sendToDestination);
         // this keeps the tool door on the same policy. Without it the stamp
         // stays pinned to the outer batch — for a provider that keeps one
         // query open across turns, the container's very first message — for
-        // the container's whole lifetime.
-        setCurrentInReplyTo(extractRouting(keep).inReplyTo);
-        query.push(prompt, extractPromptAttachments(keep));
+        // the container's whole lifetime. pushPrompt decides WHEN: now if the
+        // provider is idle, else when the live turn's result hands over.
+        const exchange = pushPrompt(prompt, toolStampFor(keep), extractPromptAttachments(keep));
+        if (toolsOnly) {
+          for (const target of replyTargetsFor(keep)) outstanding.push({ target, nudged: false, exchange });
+        }
         archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
@@ -607,13 +697,23 @@ export async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        // The exchange this result answers — see promptsPushed / resultsSeen.
+        const exchange = resultsSeen++;
         if (toolsOnly && event.isError === true) {
           log(`Tools-only provider error (not forwarded): ${(event.text ?? '').slice(0, 500)}`);
           lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
-          for (const { target } of outstanding) {
+          // Only the requests this exchange answered get the notice. A
+          // follow-up whose prompt is still queued runs afterwards and is
+          // judged at its own result; the stream-failure catch below is
+          // where the queue dies and everyone is noticed.
+          const failed = outstanding.filter((entry) => entry.exchange <= exchange);
+          for (const { target } of failed) {
             lastJudgedSeq = await writeToReplyTarget(target, TOOLS_ONLY_ERROR_NOTICE);
           }
-          outstanding.length = 0;
+          if (failed.length > 0) {
+            const failedSet = new Set(failed);
+            outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !failedSet.has(entry)));
+          }
           notifyExchangeComplete(onExchangeComplete, {
             prompt: archivePrompts[0] ?? initialPrompt,
             result: event.text ?? '',
@@ -647,27 +747,15 @@ export async function processQuery(
           // second run summary.
           if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text);
           if (toolsOnly) {
-            const beforeCount = outstanding.length;
-            lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
-            const anyDelivered = outstanding.length < beforeCount;
-            const spent = outstanding.filter((entry) => entry.nudged);
-            for (const { target } of spent) {
-              lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
-            }
-            if (spent.length > 0) {
-              const spentSet = new Set(spent);
-              outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !spentSet.has(entry)));
-            }
-            const retried = outstanding.length > 0;
-            if (retried) {
-              outstanding.forEach((entry) => (entry.nudged = true));
-              query.push(buildToolsOnlyNudge(event.text, taskBlocks));
-            }
+            const { anyDelivered, retried } = await judgeToolsOnlyTurn(
+              exchange,
+              buildToolsOnlyNudge(event.text, taskBlocks),
+            );
             notifyExchangeComplete(onExchangeComplete, {
               prompt: exchangePrompt,
               result: event.text,
               continuation: queryContinuation ?? initialContinuation,
-              status: outstanding.length === 0 && anyDelivered ? 'completed' : 'undelivered',
+              status: !retried && anyDelivered ? 'completed' : 'undelivered',
             });
             if (!retried) archivePrompts.shift();
           } else if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
@@ -701,11 +789,13 @@ export async function processQuery(
               unwrappedNudged = true;
               const destinations = getAllDestinations();
               const names = destinations.map((d) => d.name).join(', ');
-              query.push(
+              // A retry answers the same request: it inherits this exchange's stamp.
+              pushPrompt(
                 `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
                   `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
                   `Your destinations: ${names}. ` +
                   `Please re-send your response with the correct wrapping.</system>`,
+                stampOf(exchange),
               );
             }
             if (willRetryTaskBlocks) {
@@ -713,7 +803,7 @@ export async function processQuery(
               const names = getAllDestinations()
                 .map((d) => d.name)
                 .join(', ');
-              query.push(buildTaskBlockNudge(taskBlocks, names));
+              pushPrompt(buildTaskBlockNudge(taskBlocks, names), stampOf(exchange));
             }
             // A retry result (wrapping or task-block nudge) answers the SAME
             // user prompt — keep it queued so the retry archives against it,
@@ -721,22 +811,15 @@ export async function processQuery(
             if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
           }
         } else if (toolsOnly) {
-          lastJudgedSeq = reconcileToolsOnlyDeliveries(outstanding, knownRequestIds, lastJudgedSeq);
-          const spent = outstanding.filter((entry) => entry.nudged);
-          for (const { target } of spent) {
-            lastJudgedSeq = await deliverToolsOnlyPlaceholder(target);
-          }
-          if (spent.length > 0) {
-            const spentSet = new Set(spent);
-            outstanding.splice(0, outstanding.length, ...outstanding.filter((entry) => !spentSet.has(entry)));
-          }
-          if (outstanding.length > 0) {
-            outstanding.forEach((entry) => (entry.nudged = true));
-            query.push(buildToolsOnlyNudge('', []));
-          } else {
-            archivePrompts.shift();
-          }
+          const { retried } = await judgeToolsOnlyTurn(exchange, buildToolsOnlyNudge('', []));
+          if (!retried) archivePrompts.shift();
         } else archivePrompts.shift();
+        // Stamp hand-over: if a prompt is queued behind this result (a
+        // follow-up pushed mid-turn, or a nudge just pushed), the provider
+        // starts it now, so its tool sends must carry ITS request id. With
+        // nothing queued the stamp stays on the exchange that just ended —
+        // a late send still belongs to it — until the next push re-points it.
+        if (promptsPushed > resultsSeen) setCurrentInReplyTo(stampOf(resultsSeen));
         // Turn boundary: reset the per-turn sent count after the result's
         // nudge decision has used it. A nudge retry re-counts via its own
         // text events before the retry result, so resetting on every result
@@ -818,8 +901,45 @@ function deliverToolsOnlyPlaceholder(target: ReplyTarget): Promise<number> {
   return writeToReplyTarget(target, TOOLS_ONLY_PLACEHOLDER);
 }
 
+/**
+ * A triggering human request a tools-only query still owes a visible reply.
+ * `exchange` is the push ordinal of the prompt that carries it — the prompt
+ * it arrived in, or, once nudged, the nudge — and gates when it may be judged
+ * (see promptsPushed / resultsSeen in processQuery).
+ */
+interface ToolsOnlyRequest {
+  target: ReplyTarget;
+  nudged: boolean;
+  exchange: number;
+}
+
+/**
+ * The inbound id the MCP tools stamp on outbound rows for this batch. The
+ * last triggering human row wins: an accumulated trigger=0 context row riding
+ * along ahead of the engaging mention is not what the reply answers, and the
+ * tools-only reconciliation matches the stamp against reply targets, which
+ * only triggering rows become (live-observed: a reply stamped with the first
+ * context row's id). A batch with no such row — a task run, an agent-to-agent
+ * wake — keeps the batch routing's id, so a2a return-path routing is unchanged.
+ *
+ * One stamp per batch is a known limit: when two human triggers land in the
+ * same batch, only the last can be attributed by exact stamp (leg 1 of
+ * reconcileToolsOnlyDeliveries); a send for the other falls to the route leg
+ * and settles the oldest open request on that chat, so a second answer may
+ * be nudged for. Per-send attribution would need the tool call to name its
+ * request, which the tool surface does not carry today.
+ */
+function toolStampFor(batch: MessageInRow[]): string | null {
+  return stampForRouting(extractRouting(batch));
+}
+
+function stampForRouting(routing: RoutingContext): string | null {
+  const targets = routing.replyTargets ?? [];
+  return targets.length > 0 ? targets[targets.length - 1].inReplyTo : routing.inReplyTo;
+}
+
 function reconcileToolsOnlyDeliveries(
-  outstanding: Array<{ target: ReplyTarget; nudged: boolean }>,
+  outstanding: ToolsOnlyRequest[],
   knownRequestIds: Set<string>,
   afterSeq: number,
 ): number {

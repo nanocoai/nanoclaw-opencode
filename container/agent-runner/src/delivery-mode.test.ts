@@ -155,6 +155,7 @@ describe('tools-only delivery', () => {
 
   it('terminates an older dry request even when a fresh follow-up arrives before its retry result', async () => {
     const pushes: string[] = [];
+    const nudgesAtOldRetry: number[] = [];
     async function* events(): AsyncGenerator<ProviderEvent> {
       yield { type: 'result', text: 'dry first result' };
       getInboundDb()
@@ -175,7 +176,12 @@ describe('tools-only delivery', () => {
       while (!pushes.some((text) => text.includes('new question')) && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
+      // The old request's nudge result: it gets the placeholder here. The new
+      // request's prompt is still queued behind it and is NOT judged yet.
       yield { type: 'result', text: 'old retry still dry' };
+      nudgesAtOldRetry.push(pushes.filter((text) => text.includes('No user-visible message')).length);
+      // The new request's own turn runs dry → its nudge; then that runs dry too.
+      yield { type: 'result', text: 'new question turn dry' };
       yield { type: 'result', text: 'new retry still dry' };
     }
     const query: AgentQuery = {
@@ -189,6 +195,7 @@ describe('tools-only delivery', () => {
 
     const rows = visibleRows();
     expect(rows.map((row) => row.in_reply_to)).toEqual(['request-1', 'request-2']);
+    expect(nudgesAtOldRetry).toEqual([1]);
     expect(pushes.filter((text) => text.includes('No user-visible message'))).toHaveLength(2);
   });
 
