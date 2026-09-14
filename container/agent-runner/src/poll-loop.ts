@@ -295,6 +295,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation,
         midTurnCompleteDelivery,
         config.deliveryMode ?? 'envelope',
+        config.signal,
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -415,6 +416,7 @@ export async function processQuery(
    */
   modeOrEmitsMidTurnText: DeliveryMode | boolean | Pick<ProviderRuntimeContract, 'textDelivery'> = 'envelope',
   explicitDeliveryMode: DeliveryMode = 'envelope',
+  signal?: AbortSignal,
 ): Promise<QueryResult> {
   const midTurnCompleteDelivery =
     typeof modeOrEmitsMidTurnText === 'boolean'
@@ -1006,6 +1008,9 @@ export async function processQuery(
     // pushed is abandoned by this throw, including ones whose result never
     // arrived; their requests must not disappear with the closed query.
     done = true;
+    // Capture before the exchange hook: observers may stop the loop after
+    // recording a genuine failure, which must still notify its recipients.
+    const cancelled = endedForCommand || signal?.aborted;
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {
       prompt: promptOf(resultsSeen),
@@ -1013,16 +1018,33 @@ export async function processQuery(
       continuation: queryContinuation ?? initialContinuation,
       status: 'error',
     });
-    settle(resultsSeen);
-    const targets = outstanding.flatMap((entry) => (entry.target ? [entry.target] : []));
-    if (toolsOnly) {
-      await handleToolsOnlyError(errMsg, targets);
-    } else if (!routing.taskRun) {
-      const noticed: ReplyTarget[] = [];
-      for (const target of targets) {
-        if (noticed.some((done) => sameDestination(done, target))) continue;
-        noticed.push(target);
-        await writeToReplyTarget(target, 'The agent run failed. Check the logs for details.');
+    if (!cancelled) {
+      try {
+        settle(resultsSeen);
+        const targets = outstanding.flatMap((entry) => (entry.target ? [entry.target] : []));
+        if (toolsOnly || !routing.taskRun) {
+          const notice = toolsOnly ? TOOLS_ONLY_ERROR_NOTICE : 'The agent run failed. Check the logs for details.';
+          const noticed: ReplyTarget[] = [];
+          for (const target of targets) {
+            if (noticed.some((done) => sameDestination(done, target))) continue;
+            noticed.push(target);
+            try {
+              await writeToReplyTarget(target, notice);
+            } catch (noticeError) {
+              // A failed write must not replace the provider exception or
+              // prevent an independent recipient from receiving their notice.
+              log(
+                `Failed to deliver query error notice: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`,
+              );
+            }
+          }
+        }
+      } catch (deliveryError) {
+        // Without a delivery read, outstanding targets cannot be reconciled
+        // safely. Preserve the provider failure for continuation recovery.
+        log(
+          `Failed to reconcile delivery after query error: ${deliveryError instanceof Error ? deliveryError.message : String(deliveryError)}`,
+        );
       }
     }
     // Keep the original failure available to the provider's continuation

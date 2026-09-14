@@ -1,10 +1,10 @@
 # OpenCode fork development baseline
 
-This fork's `main` reconciles the reviewed OpenCode setup stack at `436abf5919561d876c7a638a151b7eec6915a022`,
+This fork's `main` reconciles the refreshed OpenCode setup stack at `24c7af0bda37f94fa387abe5fad29a9892800a86`,
 upstream NanoClaw at `3f9ed607b7e7a4872747295f75286f1c377d7c33`, and the applicable
 work preserved in the older fork and local development branches. The former
-fork main `72a2c4537243f102b8d6e1b89a904f9f08243a83` remains an ancestor; its
-history is not rewritten. The original refreshed delivery commits are also
+fork main `72a2c4537243f102b8d6e1b89a904f9f08243a83` and the earlier reconciliation
+`67f0b5edaca627f4b7b35d886869c6c935fdd7c9` remain ancestors; their histories are not rewritten. The original refreshed delivery commits are also
 retained as `archive/delivery-modes-before-reconcile`. This is a source development baseline, not a claim
 that an existing instance has been upgraded or that every account and platform
 has passed live acceptance.
@@ -13,7 +13,9 @@ has passed live acceptance.
 
 | Source | Disposition |
 | --- | --- |
-| Reviewed stack: `ec3006c4`, `59ddbd81`, `436abf59` | Current core prerequisites, self-contained OpenCode runtime/auth/model payload, setup registration and host assistance. |
+| Refreshed stack: `3c242b73`, `33c179a5`, `24c7af0b` | Current core prerequisites, OpenCode runtime/auth/model payload, setup registration and host assistance. The installed runtime explicitly implements contract seam v1; the host regression proves document and state mounts are realized exactly once through core. |
+| Original reviewed stack: `ec3006c4`, `59ddbd81`, `436abf59` | Preserved in the refreshed branches' ancestry. |
+| Fork `67f0b5ed` | Existing delivery modes, atomic channel wiring, migration safeguards and shared-registry CI resolution retained. The refreshed fork adds failure/cancellation parity without replacing its delivery accounting. |
 | Upstream `3f9ed607` | Current shared setup, channel-copy, certificate staging, interactive-card and provider-picker repairs. |
 | Delivery `d7cdb310`, `e1ea82da`, `a43da6f1`, `3bde925a` | Per-group delivery mode, tools-only enforcement, reply accounting and private provider diagnostics. Replaces the earlier fork delivery implementation. |
 | Old fork `d96f546c` | Atomic channel wiring, sender admission and approval consumption carried forward. Empty-resume runtime behavior is covered by the current provider implementation and tests. |
@@ -64,7 +66,13 @@ endpoint uses `OPENCODE_BASE_URL`, leaving Claude's `ANTHROPIC_BASE_URL` indepen
 Delivery defaults to `envelope` when unset. `tools-only` requires explicit
 messaging tools for channel delivery, corrects an undelivered chat turn once,
 and sends a bounded failure notice if a reply still cannot be delivered.
-Model scratchpad and raw provider diagnostics stay out of chat. Existing
+Model scratchpad and raw provider diagnostics stay out of chat. Thrown failures
+notify each still-unanswered address once; an already delivered reply is not
+followed by a duplicate notice. A failed notice write does not mask the original
+provider exception or stop notices to other addresses. If delivery state cannot
+be read, the loop preserves the original exception for session recovery without
+guessing which requests need notices. Explicit stop and slash-command cancellation
+do not send provider failure notices. Existing
 `tools-only` values retain their migration identity and survive materialization
 and configuration backfill. Agents cannot change their own delivery mode.
 

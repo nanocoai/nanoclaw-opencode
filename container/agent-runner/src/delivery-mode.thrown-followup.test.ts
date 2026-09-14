@@ -1,9 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 
 import type { DeliveryMode } from './config.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
-import { clearCurrentReplyRoute, clearTurnOutboundBaseline, getCurrentInReplyTo } from './db/session-state.js';
+import {
+  clearCurrentReplyRoute,
+  clearTurnOutboundBaseline,
+  getCurrentInReplyTo,
+  getContinuation,
+  setContinuation,
+} from './db/session-state.js';
+import { getAgentMailbox } from './mailbox/index.js';
 import { closeSessionDb, getInboundDb, initTestSessionDb } from './mailbox/sqlite/connection.js';
 import { runPollLoop, TOOLS_ONLY_ERROR_NOTICE } from './poll-loop.js';
 import type { AgentProvider, ProviderEvent, ProviderExchange } from './providers/types.js';
@@ -63,8 +70,11 @@ async function failAfterFollowups(
   followups: Array<{ id: string; threadId: string }>,
   answered = false,
   openingResult = true,
+  options: { beforeThrow?: () => void; cancelBeforeThrow?: boolean } = {},
 ) {
   insertInbound('request-a', 'thread-a');
+  setContinuation('mock', 'previous-session');
+  let recovered: unknown;
   const controller = new AbortController();
   const exchanges: ProviderExchange[] = [];
   const pushes: string[] = [];
@@ -76,7 +86,10 @@ async function failAfterFollowups(
   const failure = new Error(DIAGNOSTIC);
   const provider: AgentProvider = {
     registerMemorySessionHook: () => {},
-    isSessionInvalid: () => false,
+    isSessionInvalid: (error) => {
+      recovered = error;
+      return true;
+    },
     onExchangeComplete: (exchange) => {
       exchanges.push(exchange);
       if (exchange.status === 'error') controller.abort();
@@ -91,6 +104,8 @@ async function failAfterFollowups(
         if (answered) {
           for (const followup of followups) await answer(followup.id, followup.threadId);
         }
+        options.beforeThrow?.();
+        if (options.cancelBeforeThrow) controller.abort();
         throw failure;
       }
       return {
@@ -119,6 +134,8 @@ async function failAfterFollowups(
   } finally {
     clearTimeout(timeout);
   }
+  expect(recovered).toBe(failure);
+  expect(getContinuation('mock')).toBeUndefined();
   expect(pushes).toHaveLength(1);
   for (const followup of followups) expect(pushes[0]).toContain(followup.id);
   expect(routeAtFailure).toBe(openingResult ? followups.at(-1)!.id : 'request-a');
@@ -135,6 +152,60 @@ async function failAfterFollowups(
 for (const mode of ['envelope', 'tools-only'] as const) {
   describe(`${mode} thrown provider failure after a follow-up`, () => {
     const notice = mode === 'tools-only' ? TOOLS_ONLY_ERROR_NOTICE : ENVELOPE_ERROR_NOTICE;
+
+    it('retains the provider error after a failed notice write and still notices the next address', async () => {
+      let restore: (() => void) | undefined;
+      try {
+        await failAfterFollowups(
+          mode,
+          [
+            { id: 'request-b', threadId: 'thread-b' },
+            { id: 'request-d', threadId: 'thread-d' },
+          ],
+          false,
+          true,
+          {
+            beforeThrow: () => {
+              const write = spyOn(getAgentMailbox().operations, 'writeMessageOut').mockRejectedValueOnce(
+                new Error('Mailbox notice write rejected'),
+              );
+              restore = () => write.mockRestore();
+            },
+          },
+        );
+        expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id])).toEqual([
+          ['Answered request-a', 'thread-a'],
+          [notice, 'thread-d'],
+        ]);
+      } finally {
+        restore?.();
+      }
+    });
+
+    it('retains the provider error when delivery reconciliation cannot read the mailbox', async () => {
+      let restore: (() => void) | undefined;
+      try {
+        await failAfterFollowups(mode, [{ id: 'request-b', threadId: 'thread-b' }], false, true, {
+          beforeThrow: () => {
+            const read = spyOn(getAgentMailbox().operations, 'getUndeliveredMessages').mockImplementationOnce(() => {
+              throw new Error('Mailbox delivery read rejected');
+            });
+            restore = () => read.mockRestore();
+          },
+        });
+        // The delivery state is unknown: do not guess which requests still need a notice.
+        expect(visibleRows().map((row) => JSON.parse(row.content).text)).toEqual(['Answered request-a']);
+      } finally {
+        restore?.();
+      }
+    });
+
+    it('does not send a failure notice when the active query was explicitly cancelled', async () => {
+      await failAfterFollowups(mode, [{ id: 'request-b', threadId: 'thread-b' }], false, true, {
+        cancelBeforeThrow: true,
+      });
+      expect(visibleRows().map((row) => JSON.parse(row.content).text)).toEqual(['Answered request-a']);
+    });
 
     for (const threadId of ['thread-a', 'thread-b']) {
       it(`notifies the unanswered follow-up in ${threadId}, without re-notifying the answered opening request`, async () => {
@@ -176,5 +247,54 @@ for (const mode of ['envelope', 'tools-only'] as const) {
           .map((row) => row.thread_id),
       ).toEqual(['thread-b', 'thread-d']);
     });
+  });
+}
+
+for (const mode of ['envelope', 'tools-only'] as const) {
+  it(`${mode} does not report slash-command cancellation as a provider failure`, async () => {
+    insertInbound('request-a', 'thread-a');
+    const controller = new AbortController();
+    let release: () => void = () => {};
+    const aborted = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const provider: AgentProvider = {
+      registerMemorySessionHook: () => {},
+      isSessionInvalid: () => false,
+      query: () => ({
+        events: (async function* (): AsyncGenerator<ProviderEvent> {
+          yield { type: 'init', continuation: 'cancel-session' };
+          insertInbound('clear-command', 'thread-b');
+          getInboundDb()
+            .prepare('UPDATE messages_in SET content = ? WHERE id = ?')
+            .run(JSON.stringify({ text: '/clear' }), 'clear-command');
+          await aborted;
+          throw new Error(DIAGNOSTIC);
+        })(),
+        push: () => {},
+        end: () => {},
+        abort: release,
+      }),
+    };
+    const loop = runPollLoop({
+      provider,
+      providerName: 'mock',
+      cwd: '/workspace/agent',
+      deliveryMode: mode,
+      signal: controller.signal,
+    });
+    try {
+      const deadline = Date.now() + 2500;
+      while (!visibleRows().some((row) => JSON.parse(row.content).text === 'Session cleared.')) {
+        if (Date.now() >= deadline) throw new Error('Timed out waiting for the clear command');
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      controller.abort();
+      await loop;
+    }
+    expect(visibleRows().map((row) => [JSON.parse(row.content).text, row.thread_id])).toEqual([
+      ['Session cleared.', 'thread-b'],
+    ]);
   });
 }

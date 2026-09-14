@@ -1,10 +1,11 @@
 import { registerProviderContract } from '../providers/provider-registry.js';
 import { resolveOpenCodeExecutionPolicy, resolveOpenCodeInference } from '../providers/opencode-config.js';
 import { mcpServersToOpenCodeConfig } from '../providers/mcp-to-opencode.js';
-import { PROVIDER_RUNTIME_CONTRACT_SEAM_VERSION, type ProviderRuntimeContract } from './registry.js';
+import type { ProviderRuntimeContract } from './registry.js';
 
 export const opencodeRuntimeContract: ProviderRuntimeContract = {
-  seamVersion: PROVIDER_RUNTIME_CONTRACT_SEAM_VERSION,
+  // This installed payload implements v1; a core upgrade must not opt it into a new seam.
+  seamVersion: 1,
   configuration: {
     executionPolicy: { constant: resolveOpenCodeExecutionPolicy() },
     inference: resolveOpenCodeInference,
