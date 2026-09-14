@@ -48,12 +48,15 @@ export interface ProviderContainerContext {
    * providers use this to sync their own skill-discovery links.
    */
   selectedSkills: string[];
-  /** Per-group selected model, when one is configured. */
-  model?: string;
-  /** Provider-owned settings persisted by an optional provider skill. */
-  providerSettings?: unknown;
   /** `process.env` at spawn time — pull passthrough values from here. */
   hostEnv: NodeJS.ProcessEnv;
+  /**
+   * Mixed-version handshake. Present only when this host loaded a declaration
+   * and will realize its surfaces. Updated legacy callbacks keep returning env
+   * but suppress their old filesystem/mount work when this is true. Old hosts
+   * omit the field, so refreshed payloads retain their old behavior.
+   */
+  coreOwnsProviderSurfaces?: true;
 }
 
 export interface ProviderContainerContribution {

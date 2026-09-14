@@ -52,7 +52,6 @@ import { getMessagingGroup, updateMessagingGroup } from '../../db/messaging-grou
 import { getDeliveryAdapter } from '../../delivery.js';
 import { groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
-import { updateContainerConfigScalars } from '../../db/container-configs.js';
 import { log } from '../../log.js';
 import type { InboundEvent, ResolvedConversation } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
@@ -415,10 +414,7 @@ export async function buildAgentSelectionOptions(
  * Create a new agent group and initialize its filesystem. Handles
  * folder-name collisions with numeric suffixes.
  */
-export async function createNewAgentGroup(
-  name: string,
-  opts?: { provider?: string; model?: string; instructions?: string; deliveryMode?: 'envelope' | 'tools-only' },
-): Promise<AgentGroup> {
+export async function createNewAgentGroup(name: string): Promise<AgentGroup> {
   let folder = toFolder(name);
   const baseFolder = folder;
   let suffix = 2;
@@ -441,19 +437,10 @@ export async function createNewAgentGroup(
   });
 
   const ag = (await getAgentGroup(agId))!;
-  // Without an installed provider provisioner this retains the instance
-  // default. A provisioner may instead stamp an explicit provider/model before
-  // the first spawn, avoiding inheritance from global provider environment.
-  await initGroupFilesystem(ag, {
-    provider: opts?.provider,
-    instructions: opts?.instructions,
-  });
-  if (opts?.provider !== undefined || opts?.model !== undefined || opts?.deliveryMode !== undefined) {
-    await updateContainerConfigScalars(ag.id, {
-      provider: opts.provider?.toLowerCase() === 'claude' ? null : opts.provider?.toLowerCase(),
-      model: opts.model,
-      delivery_mode: opts.deliveryMode,
-    });
-  }
+  // Channel-approved groups are created on the instance default provider
+  // (DEFAULT_AGENT_PROVIDER, or claude when unset) — initGroupFilesystem stamps
+  // it onto the fresh config row. The operator flips a group afterward with
+  // `ncl groups config update --provider`.
+  await initGroupFilesystem(ag);
   return ag;
 }

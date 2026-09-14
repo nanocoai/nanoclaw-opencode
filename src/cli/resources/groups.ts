@@ -22,6 +22,8 @@ import {
 import { getSessionDriver } from '../../drivers/index.js';
 import { assertValidGroupFolder, groupFolderExistsOnDisk } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
+import { getProviderHostContract } from '../../provider-contracts/registry.js';
+import { resolveProviderName } from '../../providers/provider-name.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import {
   formatRestampResult,
@@ -52,6 +54,21 @@ function parseTimezoneFlag(value: unknown): string | null | undefined {
   return tz;
 }
 
+/**
+ * `--speed` vocabulary is provider-declared (`inference.speedTiers` on the host
+ * contract). Core only checks membership and stores the name; `""` (clear) is
+ * handled by the caller and never reaches here.
+ */
+function assertDeclaredSpeedTier(speed: string, provider: string): void {
+  const tiers = getProviderHostContract(provider)?.inference?.speedTiers;
+  if (tiers === undefined) {
+    throw new Error(`provider "${provider}" declares no speed tiers; --speed accepts only "" (clear)`);
+  }
+  if (!tiers.includes(speed)) {
+    throw new Error(`--speed "${speed}" is not a speed tier of provider "${provider}" (declared: ${tiers.join(', ')})`);
+  }
+}
+
 /** Deserialize JSON columns for display. */
 function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
   return {
@@ -59,6 +76,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     provider: row.provider,
     model: row.model,
     effort: row.effort,
+    speed: row.speed,
     image_tag: row.image_tag,
     assistant_name: row.assistant_name,
     max_messages_per_prompt: row.max_messages_per_prompt,
@@ -69,6 +87,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
     timezone: row.timezone,
+    delivery_mode: row.delivery_mode,
     updated_at: row.updated_at,
   };
 }
@@ -371,7 +390,8 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
+        'Use --id <group-id> and any of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --delivery-mode, ' +
+        '--speed must be one of the speed tiers the group\'s provider declares (Claude: "standard", "fast"), or "" to follow the install default; a provider that declares none accepts only "". ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args) => {
         const id = args.id as string;
@@ -385,11 +405,13 @@ registerResource({
             | 'provider'
             | 'model'
             | 'effort'
+            | 'speed'
             | 'image_tag'
             | 'assistant_name'
             | 'max_messages_per_prompt'
             | 'cli_scope'
             | 'timezone'
+            | 'delivery_mode'
           >
         > = {};
         if (args.provider !== undefined) updates.provider = args.provider as string;
@@ -397,6 +419,14 @@ registerResource({
         if (timezone !== undefined) updates.timezone = timezone;
         if (args.model !== undefined) updates.model = args.model as string;
         if (args.effort !== undefined) updates.effort = args.effort as string;
+        if (args.speed !== undefined) {
+          const speed = args.speed as string;
+          // Validate against the provider the group will actually run on —
+          // the same rule spawn applies, with a `--provider` in this command
+          // taking precedence over the stored one.
+          if (speed !== '') assertDeclaredSpeedTier(speed, resolveProviderName(updates.provider, row.provider));
+          updates.speed = speed || null;
+        }
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
         if (args.assistant_name !== undefined) updates.assistant_name = args.assistant_name as string;
         if (args.max_messages_per_prompt !== undefined)
@@ -408,10 +438,17 @@ registerResource({
           }
           updates.cli_scope = scope;
         }
+        if (args['delivery-mode'] !== undefined || args.delivery_mode !== undefined) {
+          const mode = (args['delivery-mode'] ?? args.delivery_mode) as string;
+          if (!['envelope', 'tools-only'].includes(mode)) {
+            throw new Error('--delivery-mode must be one of: envelope, tools-only');
+          }
+          updates.delivery_mode = mode;
+        }
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --effort, --speed, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --delivery-mode, --timezone',
           );
         }
 

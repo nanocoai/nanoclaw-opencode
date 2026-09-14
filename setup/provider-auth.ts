@@ -11,48 +11,56 @@
  * re-running full setup, it touches nothing else: no install-wide default
  * provider rewrite, no service changes. Provider install skills call this as
  * their auth step so there is exactly one auth implementation per provider.
+ * Pass --refresh to intentionally replace the installed payload and update its
+ * dependency pins before authentication.
  */
 import { buildContainerImage } from './lib/container-build.js';
+import * as p from '@clack/prompts';
+import { HARDENED_IMAGE_ENV_KEY, readImageSource, writeImageSource } from './lib/registry-state.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
 import { applyProviderSkill } from './providers/install.js';
+import { getInstallableProviderDescriptor, providerImagePolicy } from './providers/skill-descriptor.js';
 // Provider payloads self-register on import.
 import './providers/index.js';
 
-// Hard-wired install skills — the audited control surface (no branch
-// enumeration). Each `/add-<name>` SKILL.md is idempotent and self-skips when
-// the payload is already wired; it is applied in-process via the directive
-// engine (no shell-out to a drift-prone setup/add-<name>.sh).
-const INSTALL_SKILLS: Record<string, string> = {
-  codex: '.claude/skills/add-codex',
-  opencode: '.claude/skills/add-opencode',
-};
-
 export async function run(args: string[]): Promise<void> {
   const name = args[0]?.trim().toLowerCase();
+  const refresh = args.slice(1).includes('--refresh');
   const withAuth = listSetupProviders().filter((entry) => entry.runAuth);
 
-  if (!name) {
+  if (!name || args.slice(1).some((arg) => arg !== '--refresh')) {
     console.error(
-      `Usage: pnpm exec tsx setup/index.ts --step provider-auth <provider>\n` +
+      `Usage: pnpm exec tsx setup/index.ts --step provider-auth <provider> [--refresh]\n` +
         `Providers with an auth step: ${withAuth.map((entry) => entry.value).join(', ') || '(none installed)'}`,
     );
     process.exit(1);
   }
 
   let entry = getSetupProvider(name);
-  const skillDir = INSTALL_SKILLS[name];
-  if (skillDir) {
-    // Install only: applied in install mode, so an already-wired payload file,
-    // barrel line, or manifest pin is skipped, never overwritten — a re-run over
-    // an installed provider is a no-op that leaves local patches alone.
-    // Refreshing installed payload code and pins is `/update-skills`
-    // (scripts/update-skills.ts, refresh mode). Applied in-process via the
-    // directive engine; build + auth are this flow's job (the engine's
-    // build/test/auth run directives are skipped), so we rebuild the image
-    // whenever the install mutated anything (the container CLI manifest is
-    // baked into the image, unlike the mounted payload code).
-    console.log(`${entry ? 'Checking' : 'Installing'} ${name}…`);
-    const { changed, blockers } = await applyProviderSkill(skillDir, process.cwd());
+  const skillDir = getInstallableProviderDescriptor(name)?.skillDir;
+  if (refresh && !skillDir) throw new Error(`Provider '${name}' has no install skill to refresh.`);
+  if (skillDir && (!entry || refresh)) {
+    if (providerImagePolicy(name) === 'local-required' && readImageSource() === 'hardened') {
+      if (process.env[HARDENED_IMAGE_ENV_KEY]?.trim().toLowerCase() === 'true') {
+        throw new Error(
+          `Unset exported ${HARDENED_IMAGE_ENV_KEY} before installing a provider that requires a local image.`,
+        );
+      }
+      const local = await p.confirm({
+        message: `${name} needs a sandbox image built on this machine. Stop using the pre-built one?`,
+        initialValue: true,
+      });
+      if (p.isCancel(local) || !local)
+        throw new Error('Provider installation cancelled; the existing image and payload are unchanged.');
+      writeImageSource('local');
+    }
+    // Already registered providers authenticate directly unless refresh was
+    // requested. That keeps reauthentication usable without registry/build
+    // access and preserves the operator's installed payload and pins.
+    console.log(`${refresh ? 'Refreshing' : 'Installing'} ${name}…`);
+    const { changed, blockers } = await applyProviderSkill(skillDir, process.cwd(), {
+      mode: refresh ? 'refresh' : 'install',
+    });
     if (blockers.length) {
       console.error(`Couldn't install ${name}: ${blockers.join('; ')}`);
       process.exit(1);
@@ -69,7 +77,10 @@ export async function run(args: string[]): Promise<void> {
       }
     }
     if (!entry) {
-      await import(`./providers/${name}.js`);
+      // Resolve after installation; a bundler's static glob cannot include a
+      // provider module that was absent when this setup module first loaded.
+      const installedModule = `./providers/${name}.js`;
+      await import(installedModule);
       entry = getSetupProvider(name);
     }
     if (!entry) {

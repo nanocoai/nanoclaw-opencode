@@ -1,7 +1,9 @@
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
-import type { PromptAttachment } from './providers/types.js';
 import { TIMEZONE, formatLocalTime, formatLocalStamp } from './timezone.js';
+import './providers/index.js';
+import './provider-contracts/index.js';
+import { getProviderRuntimeContract } from './providers/provider-registry.js';
 
 /**
  * channel_type marking cross-session context copies (accumulate fan-out from
@@ -24,8 +26,41 @@ export function isSessionEcho(msg: MessageInRow): boolean {
  */
 export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
-const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
-const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/start']);
+/** Commands the runner itself handles, whatever provider is active. */
+const RUNNER_ADMIN_COMMANDS = ['/clear', '/upload-trace'];
+
+interface CommandSets {
+  admin: ReadonlySet<string>;
+  filtered: ReadonlySet<string>;
+}
+
+const commandSetsByProvider = new Map<string, CommandSets>();
+
+/**
+ * The command lists for the ACTIVE provider: the runner's own commands plus
+ * the native admin/filtered commands its contract declares. Another
+ * registered contract's lists are never consulted — a session runs exactly
+ * one provider. A provider without a contract contributes nothing.
+ */
+// What the formatter applied to every provider before runtime contracts
+// existed. Only the contractless fallback reads these; a declared contract
+// supplies its own lists.
+const LEGACY_NATIVE_ADMIN_COMMANDS = ['/remote-control', '/compact', '/context', '/cost', '/files'];
+const LEGACY_NATIVE_FILTERED_COMMANDS = ['/help', '/login', '/logout', '/doctor', '/config', '/start'];
+
+function commandSets(providerName: string): CommandSets {
+  const cached = commandSetsByProvider.get(providerName);
+  if (cached) return cached;
+  const contract = getProviderRuntimeContract(providerName);
+  const sets: CommandSets = {
+    // A provider with no contract keeps the lists the formatter hard-coded
+    // before contracts existed, so a pre-contract payload sees no change.
+    admin: new Set([...RUNNER_ADMIN_COMMANDS, ...(contract?.commands.nativeAdmin ?? LEGACY_NATIVE_ADMIN_COMMANDS)]),
+    filtered: new Set(contract?.commands.nativeFiltered ?? LEGACY_NATIVE_FILTERED_COMMANDS),
+  };
+  commandSetsByProvider.set(providerName, sets);
+  return sets;
+}
 
 export interface CommandInfo {
   category: CommandCategory;
@@ -36,7 +71,8 @@ export interface CommandInfo {
 
 /**
  * Categorize a message as a command or not.
- * Only applies to chat/chat-sdk messages.
+ * Only applies to chat/chat-sdk messages. `providerName` is the active
+ * provider whose contract supplies the native command lists.
  *
  * The extracted `senderId` is compared against `NANOCLAW_ADMIN_USER_IDS`
  * which stores ids in the namespaced form `<channel_type>:<raw>` (see
@@ -45,7 +81,7 @@ export interface CommandInfo {
  * contains a `:` we assume it's pre-namespaced (non-chat-sdk adapters
  * that populate `senderId` directly) and leave it alone.
  */
-export function categorizeMessage(msg: MessageInRow): CommandInfo {
+export function categorizeMessage(msg: MessageInRow, providerName: string): CommandInfo {
   const content = parseContent(msg.content);
   const text = (content.text || '').trim();
   const senderId = extractSenderId(msg, content);
@@ -59,11 +95,12 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
   // Extract the command name (e.g., '/clear' from '/clear some args')
   const command = text.split(/\s/)[0].toLowerCase();
 
-  if (ADMIN_COMMANDS.has(command)) {
+  const commands = commandSets(providerName);
+  if (commands.admin.has(command)) {
     return { category: 'admin', command, text, senderId };
   }
 
-  if (FILTERED_COMMANDS.has(command)) {
+  if (commands.filtered.has(command)) {
     return { category: 'filtered', command, text, senderId };
   }
 
@@ -88,9 +125,9 @@ export function isClearCommand(msg: MessageInRow): boolean {
  * a query's first input. Used by the follow-up poller to bail out and let
  * the outer loop reopen the query.
  */
-export function isRunnerCommand(msg: MessageInRow): boolean {
+export function isRunnerCommand(msg: MessageInRow, providerName: string): boolean {
   if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
-  const cat = categorizeMessage(msg).category;
+  const cat = categorizeMessage(msg, providerName).category;
   return cat === 'admin' || cat === 'passthrough';
 }
 
@@ -118,10 +155,25 @@ export interface RoutingContext {
    *  delivers from a task session; final-text `<message to>` blocks are inert
    *  and the final text auto-appends to the series run log. */
   taskRun: boolean;
+  /**
+   * One entry per row in the batch that someone is waiting on, oldest first.
+   * Deliberately not the batch address above, which comes from the FIRST row: a
+   * batch mixing a host notice with a user question would otherwise send the
+   * user's answer into the agent channel, and collapsing the batch to a single
+   * target would leave a second question in the same batch unanswerable.
+   * Empty when no row in the batch has a human endpoint.
+   */
   replyTargets?: ReplyTarget[];
+  /**
+   * The batch's only wake-eligible rows arrived over an agent channel: a host
+   * notice (approval outcome, restart, self-modification) or peer traffic.
+   * There is a correspondent, so the model can still be corrected — but there
+   * is no human endpoint, so nothing is emitted toward it.
+   */
   agentWake?: boolean;
 }
 
+/** Everything needed to address one outbound message back at its origin. */
 export interface ReplyTarget {
   platformId: string | null;
   channelType: string | null;
@@ -129,30 +181,39 @@ export interface ReplyTarget {
   inReplyTo: string | null;
 }
 
-export function replyTargetsFor(messages: MessageInRow[]): ReplyTarget[] {
-  return messages
-    .filter(
-      (message) =>
-        (message.kind === 'chat' || message.kind === 'chat-sdk') &&
-        message.trigger === 1 &&
-        message.channel_type !== null &&
-        message.channel_type !== 'agent',
-    )
-    .map((message) => ({
-      platformId: message.platform_id,
-      channelType: message.channel_type,
-      threadId: message.thread_id,
-      inReplyTo: message.id,
-    }));
+/** Wake-eligible conversational rows — the ones that put someone on the hook. */
+function isTriggerMessage(msg: MessageInRow): boolean {
+  return (msg.kind === 'chat' || msg.kind === 'chat-sdk') && msg.trigger === 1;
 }
 
-export function hasAgentWake(messages: MessageInRow[]): boolean {
-  return messages.some(
-    (message) =>
-      (message.kind === 'chat' || message.kind === 'chat-sdk') &&
-      message.trigger === 1 &&
-      message.channel_type === 'agent',
-  );
+/**
+ * True when this row is a person's message addressed to the agent, i.e. someone
+ * is on the other end waiting to be answered.
+ *
+ * Agent-channel rows are excluded. Those cover peer traffic AND the host's own
+ * notices, which are written into the user's session as `agent` chat rows — a
+ * correspondent worth answering, but not one an emitted message can reach. A
+ * row with no channel has nowhere to send anything either.
+ */
+export function isUserChannelTrigger(msg: MessageInRow): boolean {
+  return isTriggerMessage(msg) && msg.channel_type !== null && msg.channel_type !== 'agent';
+}
+
+/** Wake-eligible rows arriving over an agent channel (host notices, peers). */
+export function isAgentChannelTrigger(msg: MessageInRow): boolean {
+  return isTriggerMessage(msg) && msg.channel_type === 'agent';
+}
+
+/**
+ * Every row in the batch a person is waiting on, oldest first — one per row,
+ * each addressed at its own origin. Two questions arriving in the same poll
+ * batch are two separate things owed, and a single collapsed target would make
+ * the second one impossible to answer or chase.
+ */
+export function replyTargetsFor(messages: MessageInRow[]): ReplyTarget[] {
+  return messages
+    .filter(isUserChannelTrigger)
+    .map((m) => ({ platformId: m.platform_id, channelType: m.channel_type, threadId: m.thread_id, inReplyTo: m.id }));
 }
 
 /**
@@ -173,11 +234,9 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     inReplyTo: first?.id ?? null,
     // Echo rows riding along with a task must not disable one-door delivery:
     // taskRun as long as at least one task row and no non-task/non-echo row.
-    taskRun:
-      messages.some((m) => m.kind === 'task') &&
-      messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
+    taskRun: messages.some((m) => m.kind === 'task') && messages.every((m) => m.kind === 'task' || isSessionEcho(m)),
     replyTargets,
-    agentWake: replyTargets.length === 0 && hasAgentWake(messages),
+    agentWake: replyTargets.length === 0 && messages.some(isAgentChannelTrigger),
   };
 }
 
@@ -243,7 +302,7 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyAttr = content.replyTo?.id ? ` reply_to="${escapeXml(String(content.replyTo.id))}"` : '';
   const replyPrefix = formatReplyContext(content.replyTo);
   const linksSuffix = formatLinks(content.links, text);
-  const attachmentsSuffix = formatAttachments(content.attachments, msg.id);
+  const attachmentsSuffix = formatAttachments(content.attachments);
   const appContextSuffix = formatAppContext(content.app_context);
 
   const fromAttr = originAttr(msg);
@@ -391,85 +450,19 @@ function formatLinks(links: any[] | undefined, text: string): string {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function formatAttachments(attachments: any[] | undefined, messageId: string): string {
+function formatAttachments(attachments: any[] | undefined): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
   const parts = attachments.map((a) => {
-    if (!a || typeof a !== 'object') return '[file: attachment]';
-    const name =
-      typeof a.name === 'string' ? a.name : typeof a.filename === 'string' ? a.filename : 'attachment';
-    const type = typeof a.type === 'string' ? a.type : 'file';
-    // `localPath` is inbound JSON, not proof that the host staged a file.
-    // Render a readable path only when it is the canonical current-message
-    // inbox path built by session-manager; otherwise an attacker could steer
-    // the model into reading an unrelated workspace file through its tools.
-    const expectedLocalPath =
-      typeof a.name === 'string' &&
-      isSafeAttachmentComponent(a.name) &&
-      isSafeAttachmentComponent(messageId)
-        ? `inbox/${messageId}/${a.name}`
-        : '';
-    const localPath =
-      typeof a.localPath === 'string' && a.localPath === expectedLocalPath ? `/workspace/${expectedLocalPath}` : '';
-    const url = typeof a.url === 'string' ? a.url : '';
+    const name = a.name || a.filename || 'attachment';
+    const type = a.type || 'file';
+    const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
+    const url = a.url || '';
     if (localPath) {
       return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
     }
     return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
   });
   return '\n' + parts.join('\n');
-}
-
-/** True for a single safe path component (the host uses the same invariant). */
-function isSafeAttachmentComponent(value: string): boolean {
-  return (
-    value.length > 0 &&
-    value !== '.' &&
-    value !== '..' &&
-    !value.includes('/') &&
-    !value.includes('\\') &&
-    !value.includes('\0')
-  );
-}
-
-/**
- * Return the native-media view of attachments from exactly `messages`.
- *
- * Inbound content is untrusted JSON. Only host-staged files whose path binds
- * the sanitized name to the current message id are accepted. Caller-supplied
- * URLs and arbitrary `localPath` values never become provider file parts.
- * The prompt rendering above remains the fallback for rejected entries.
- */
-export function extractPromptAttachments(messages: MessageInRow[]): PromptAttachment[] {
-  const out: PromptAttachment[] = [];
-  for (const msg of messages) {
-    if (!isSafeAttachmentComponent(msg.id)) continue;
-    const content = parseContent(msg.content);
-    if (!Array.isArray(content.attachments)) continue;
-
-    for (const raw of content.attachments) {
-      if (!raw || typeof raw !== 'object') continue;
-      const attachment = raw as Record<string, unknown>;
-      const filename = attachment.name;
-      const localPath = attachment.localPath;
-      if (typeof filename !== 'string' || !isSafeAttachmentComponent(filename)) continue;
-      if (typeof localPath !== 'string') continue;
-
-      const expectedLocalPath = `inbox/${msg.id}/${filename}`;
-      if (localPath !== expectedLocalPath) continue;
-
-      out.push({
-        sourceMessageId: msg.id,
-        filename,
-        path: `/workspace/${expectedLocalPath}`,
-        ...(typeof attachment.mimeType === 'string' && attachment.mimeType.length > 0
-          ? { mime: attachment.mimeType }
-          : typeof attachment.mime === 'string' && attachment.mime.length > 0
-            ? { mime: attachment.mime }
-            : {}),
-      });
-    }
-  }
-  return out;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

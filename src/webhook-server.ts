@@ -14,10 +14,8 @@ import http from 'http';
 
 import type { Chat } from 'chat';
 
-import { readEnvFile } from './env.js';
+import { getWebhookPort } from './config.js';
 import { log } from './log.js';
-
-const DEFAULT_PORT = 3000;
 
 interface WebhookEntry {
   chat: Chat;
@@ -111,10 +109,9 @@ export function registerWebhookHandler(path: string, handler: RawWebhookHandler)
 function ensureServer(): void {
   if (server) return;
 
-  const dotenv = readEnvFile(['WEBHOOK_PORT']);
-  const port = parseInt(process.env.WEBHOOK_PORT || dotenv.WEBHOOK_PORT || String(DEFAULT_PORT), 10);
+  const port = getWebhookPort();
 
-  server = http.createServer((req, res) => {
+  const candidate = http.createServer((req, res) => {
     void (async () => {
       const url = req.url || '/';
 
@@ -163,7 +160,16 @@ function ensureServer(): void {
     })();
   });
 
-  server.listen(port, '0.0.0.0', () => {
+  // Keep the candidate as the singleton while listen is pending so concurrent
+  // registrations cannot create competing listeners. A failed listen must
+  // release that singleton, though, or later registrations can never retry.
+  server = candidate;
+  candidate.on('error', (err) => {
+    if (!candidate.listening && server === candidate) server = null;
+    log.error('Webhook server error', { port, err });
+  });
+
+  candidate.listen(port, '0.0.0.0', () => {
     log.info('Webhook server started', { port, adapters: [...routes.keys()] });
   });
 }

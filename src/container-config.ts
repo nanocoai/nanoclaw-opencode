@@ -16,7 +16,7 @@ import { getContainerConfig } from './db/container-configs.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { isValidTimezone } from './timezone.js';
 import { log } from './log.js';
-import type { AgentGroup, ContainerConfigRow } from './types.js';
+import type { AgentGroup, ContainerConfigRow, ContainerSpeed } from './types.js';
 
 /**
  * Container-side path where a group's stamped plugins are mounted read-only.
@@ -235,6 +235,7 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+/** How the agent in a group reaches a destination. */
 export type DeliveryMode = 'envelope' | 'tools-only';
 
 /** Shape of the materialized `container.json` file read by the container runner. */
@@ -250,10 +251,14 @@ export interface ContainerConfig {
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
   model?: string;
-  providerSettings?: unknown;
   effort?: string;
-  /** API fast serving tier for this container; absent = the provider default. */
-  fastMode?: boolean;
+  /**
+   * Legacy mirror of `speed: 'fast'`, written exactly as the host did before
+   * `speed` existed so an agent image built then keeps fast mode working.
+   */
+  fastMode?: true;
+  /** Provider-declared speed tier (`standard` or `fast` for Claude); the group value overrides the install default. */
+  speed?: ContainerSpeed;
   timezone?: string;
   deliveryMode?: DeliveryMode;
   /** Session isolation tier for the group's containers; absent = the composer's default ('container'). */
@@ -377,13 +382,34 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     // The group's own model wins; NANOCLAW_DEFAULT_MODEL fills in for groups
     // that have none. Both absent leaves the field out and the SDK decides.
     model: row.model ?? (DEFAULT_MODEL || undefined),
-    providerSettings: row.provider_settings ? JSON.parse(row.provider_settings) : undefined,
     effort: row.effort ?? undefined,
-    fastMode: FAST_MODE || undefined,
+    // A cleared group value falls back to the install-wide default.
+    ...speedFields(parseContainerSpeed(row.speed) ?? (FAST_MODE ? 'fast' : undefined)),
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,
-    deliveryMode: row.delivery_mode === 'tools-only' ? 'tools-only' : undefined,
     runtimeTier: parseRuntimeTier(row.runtime_tier, group.name),
+    // Never pass an unknown value to the runner. Omission resolves to the
+    // historical envelope contract there.
+    deliveryMode: isDeliveryMode(row.delivery_mode) ? row.delivery_mode : undefined,
   };
+}
+
+export function isDeliveryMode(value: unknown): value is DeliveryMode {
+  return value === 'envelope' || value === 'tools-only';
+}
+
+/** The stored tier was validated against the provider's declaration when written; empty means unset. */
+function parseContainerSpeed(value: string | null): ContainerSpeed | undefined {
+  return value ? value : undefined;
+}
+
+/**
+ * Unset writes neither key, so an install that sets nothing produces the same
+ * file it always did. `fast` also writes the legacy `fastMode: true`, in the
+ * position it always had, for agent images that still read only that key.
+ */
+function speedFields(speed: ContainerSpeed | undefined): Pick<ContainerConfig, 'fastMode' | 'speed'> {
+  if (speed === undefined) return {};
+  return speed === 'fast' ? { fastMode: true, speed } : { speed };
 }
 
 /**

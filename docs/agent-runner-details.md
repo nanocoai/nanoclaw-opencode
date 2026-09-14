@@ -21,10 +21,6 @@ continuation token to resume, the working directory, and system context to injec
 
 ```typescript
 interface AgentProvider {
-  /** True if the SDK handles slash commands natively and wants them passed
-   *  through raw. When false, the poll-loop formats them like any chat message. */
-  readonly supportsNativeSlashCommands: boolean;
-
   /** Register shared memory through the provider's native session-start mechanism. */
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void;
 
@@ -53,8 +49,6 @@ interface ProviderOptions {
   additionalDirectories?: string[];
   model?: string;   // alias (sonnet/opus/haiku) or full model ID
   effort?: string;  // low | medium | high | xhigh | max
-  deliveryMode?: 'envelope' | 'tools-only';  // the contract the poll-loop enforces; providers
-                                             // that re-state it (e.g. after compaction) must match
 }
 
 interface QueryInput {
@@ -115,6 +109,61 @@ type ProviderEvent =
 - **`progress`** — optional, for logging. The agent-runner logs these but doesn't act on them.
 - **`activity`** — a liveness signal. Providers MUST yield it on every underlying SDK event (tool call, thinking, partial message) so the poll-loop's idle timer stays honest during long tool runs.
 
+## Runtime provider contract
+
+Besides implementing `AgentProvider`, every provider declares a **runtime contract**
+(`container/agent-runner/src/provider-contracts/`). The contract is not a description
+core reads once and forgets — each field is consumed by core at a specific moment.
+
+What a provider declares:
+
+- `configuration` — `executionPolicy` (mandatory), and optionally `inference`, `memory`,
+  `mcpServers`. All four share one shape, `Capability<I>`: either a function
+  `(input, env) => answer` of the core-owned input, or a declared constant
+  `{ constant: answer }`. **Core calls the functions, not the provider.** `createProvider`
+  resolves `executionPolicy`, `inference` and `mcpServers` and passes the result to the
+  provider factory as its second argument; `memory` is resolved when core registers the
+  memory session hook and passed as the second argument of `registerMemorySessionHook`.
+  The core-owned inputs are named types in `provider-contracts/registry.ts` —
+  `RuntimeInferenceInput` for `inference`, `RuntimeMemoryHookInput` for `memory`, the
+  `McpServerConfig` map for `mcpServers` — and a provider's resolve names them rather
+  than restating the shape, so a field core adds reaches every provider through the type.
+- `lifecycle` — `memorySessionHookRegistration` (runs when core registers the memory hook)
+  and `beforeQuery` (runs before each query).
+- `history` — `afterExchange` (the factory wraps `onExchangeComplete` with it) and
+  `readTrace` (what `/upload-trace` uploads). Anything else a provider does with its own
+  transcript — Claude's pre-compact archive and continuation rotation, for example — is
+  provider-internal code (`providers/claude-history.ts`), not a contract field.
+- `textDelivery`, `commands` — read by the poll-loop and formatter. The formatter's
+  native command lists and `/upload-trace` read the **active** provider's contract only;
+  other registered contracts are never consulted.
+
+Registration is **two-step** and order-independent. The provider module calls
+`registerProvider(name, factory)`; the contract module calls
+`registerProviderContract(name, contract)`. Neither file imports the other, so a
+skill-installed provider still compiles on a core that predates the contract seam (the
+contract file is simply not imported there). Barrels: `providers/index.ts` and
+`provider-contracts/index.ts` — a skill appends one import line to each. Claude and the
+test-double `mock` register exactly this way; no provider is special-cased.
+
+A provider without a contract keeps working: the poll-loop falls back to the legacy
+instance flags (`supportsNativeSlashCommands`, `emitsMidTurnText`).
+
+Conformance: `provider-contracts/testing/conformance.ts` exports
+`defineProviderConformance(name, contract, options?)`, which registers the shape checks and
+the "does each function capability respond to its input" probes as `bun:test` cases.
+Constants are not probed. When the default probe inputs cannot exercise a function (an
+env-gated resolve, say), pass `options.probes` — e.g.
+`{ inference: { a, b, environment? } }`. Probe fixtures live with the tests, never on the
+contract. Every provider ships `providers/<name>.conformance.test.ts` calling
+`defineProviderConformance` for its own contract — Claude and the test-double `mock`
+included; no provider is special-cased. Core runs no generic sweep over the registered
+contracts: which probe fixtures a contract needs is provider knowledge (a provider whose
+inference is environment-provisioned does not vary on `model`, say), so only the provider's
+own test file can supply them. The install-time verifier requires the file for every
+declared provider. `bun src/provider-contracts/names.ts` lists registered providers and
+contracts.
+
 ## Provider Implementations
 
 Only the `claude` provider ships in trunk. The Codex and OpenCode sections below document the provider interface for reference and for skills that install additional providers — they are not baked into the core image.
@@ -129,7 +178,6 @@ only reads the per-turn `QueryInput`.
 
 ```typescript
 class ClaudeProvider implements AgentProvider {
-  readonly supportsNativeSlashCommands = true;
   // ...constructor stores options.mcpServers, .env, .additionalDirectories,
   //    .model, .effort, .assistantName...
 
@@ -289,59 +337,72 @@ class CodexProvider implements AgentProvider {
 
 ### OpenCode Provider
 
-Wraps `@opencode-ai/sdk` (`container/agent-runner/src/providers/opencode.ts`).
+Wraps `@opencode-ai/sdk`.
 
-**One shared server per container.** The first `query()` spawns `opencode serve`
-(port 4096, detached process group) and subscribes to its SSE event stream; every
-later query reuses that runtime as long as the config key (model, provider, MCP
-servers, cwd) is unchanged. The lifecycle is self-healing: a failed init is never
-cached (a slow listen line or a stolen port costs one turn, not the container's
-lifetime), a spawned server whose client setup fails is reaped rather than left
-holding the port, and a server that exits or whose stream ends drops itself from
-the cache so the next turn respawns it.
+```typescript
+class OpenCodeProvider implements AgentProvider {
+  query(input: QueryInput): AgentQuery {
+    // OpenCode runs a local server — create it once, reuse across queries
+    const { client, server } = await createOpencode({ config: this.buildConfig(input) });
+    const { stream } = await client.event.subscribe();
 
-**Turns.** A query creates one OpenCode session (or resumes the stored
-continuation), yields `init`, and then runs each prompt — the opening one and
-every `push()` — as `session.promptAsync` followed by reading the shared stream
-until that session's `session.idle`. Events are filtered by `sessionID` because
-the stream carries every session on the server. A resume that produces no
-assistant work falls back once to a fresh session (see `isEmptyOpenCodeResume`).
+    let aborted = false;
+    let pendingFollowUp: string | null = null;
 
-**Abort.** `abort()` calls `session.abort` on the turn the generator has in
-flight and leaves the server running — a `/clear` or `/compact` no longer costs a
-respawn. A turn parked in `session.create()` or `promptAsync()` when the abort
-lands re-checks on resume, stops the session it just obtained, and returns
-without processing it. An aborted turn never triggers the empty-resume fallback.
+    return {
+      push: (msg) => {
+        pendingFollowUp = msg;
+        server.close();  // interrupt current query
+      },
+      end: () => { /* no-op */ },
+      abort: () => { aborted = true; server.close(); },
+      events: this.run(client, server, stream, input, () => pendingFollowUp),
+    };
+  }
 
-**Watchdogs (two tiers, both per turn):**
+  private async *run(client, server, stream, input, getPendingFollowUp): AsyncIterable<ProviderEvent> {
+    const session = await client.session.create();
+    yield { type: 'init', continuation: session.data.id };
 
-| Tier | Trips when | Action | Env knob (ms) |
-|------|-----------|--------|---------------|
-| Stream silence | no event of any kind — the server's 10 s `server.heartbeat` included — for the budget | server is dead or wedged: `destroySharedRuntime()` aborts the SSE subscription (which is what wakes the parked read; a SIGKILL alone would not, the SDK reconnects forever) and kills the process group; turn errors `OpenCode event stream silent for N ms; server dropped`; next turn respawns | `OPENCODE_STREAM_SILENCE_MS`, default 60000 |
-| Activity | stream alive but no agent activity event for the budget | backend is wedged: `session.abort` for that session only; turn errors `OpenCode turn produced no activity for N ms; aborted`; server stays | `OPENCODE_IDLE_TIMEOUT_MS`, default 900000 (15 min) |
+    await client.session.promptAsync({
+      path: { id: session.data.id },
+      body: { parts: [{ type: 'text', text: input.prompt }] },
+    });
 
-Neither tier covers a `session.create()` or `promptAsync()` POST that never
-returns — the watchdog interval starts once the prompt is accepted — so that
-case is bounded by the host sweep's stale-heartbeat kill of the container.
-The SSE subscription has no retry cap on purpose: the SDK counts reconnect
-attempts cumulatively per subscription and never resets them, so a cap would
-end a long-lived container's stream for good on the Nth transient `/event`
-hiccup; the abort signal and the silence tier are the stops.
+    for await (const event of stream) {
+      if (event.type === 'session.idle') {
+        // Collect result text from accumulated message parts
+        const resultText = this.extractResult(event);
+        yield { type: 'result', text: resultText };
 
-Heartbeats count as liveness for the first tier only; they are not agent
-activity, so the runner's own heartbeat file stays tied to real work. Neither
-error clears the stored continuation: `isSessionInvalid` fires only on
-OpenCode's own `NotFoundError` for the session id (the server's
-`Session not found: <id>`, HTTP 404), never on backend/model errors, connection
-resets, or watchdog errors — the on-disk session is intact in all of those.
+        const followUp = getPendingFollowUp();
+        if (followUp) {
+          await client.session.promptAsync({
+            path: { id: session.data.id },
+            body: { parts: [{ type: 'text', text: followUp }] },
+          });
+          continue;
+        }
+
+        return;
+      }
+
+      if (event.type === 'session.error') {
+        yield { type: 'error', message: event.properties?.error?.data?.message, retryable: false };
+        return;
+      }
+    }
+  }
+}
+```
 
 **OpenCode-specific behavior inside the provider:**
-- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`, `OPENCODE_SMALL_MODEL`)
+- Local gRPC/HTTP server lifecycle (`server.close()`)
+- SSE event stream for output
+- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`)
 - MCP config format translation (`type: 'local'`, `command: [cmd, ...args]`, `environment`)
 - System prompt injected via `<system>` prefix in prompt text
-- Memory delivered by running the registered session hook at startup and after `session.compacted`; a routing-discipline reminder rides the first prompt after a compaction
-- Interactive `question` tool denied in config and auto-answered on the stream as a belt-and-suspenders guard
-- Resume is by session id: the stored continuation is the OpenCode session id
+- No resume support (sessions are always new or reused by ID)
 
 ## Agent-Runner Core
 
@@ -386,6 +447,47 @@ Everything below is handled by the agent-runner, not the provider.
 - The agent is actively working (tool calls in progress, subagents running)
 
 The agent-runner signals "busy" status to the host. The mechanism for this is provider-specific — for Claude, the query AsyncGenerator is still yielding events. For others, the agent-runner can write a heartbeat or status indicator to the session DB that the host checks before killing.
+
+### Delivery Modes
+
+Each agent group has a `delivery_mode` in its container config, set with
+`ncl groups config update --delivery-mode envelope|tools-only` and materialized
+into `container.json` for the runner:
+
+- **`envelope`** (default) — final-text `<message to="name">` blocks deliver;
+  other response text is scratchpad. An unwrapped turn is nudged once. This is
+  the behavior existing groups had before the setting was added.
+- **`tools-only`** — only outbound tool calls such as `send_message`,
+  `send_file`, `send_card`, and `ask_user_question` deliver. Envelopes,
+  tool-shaped markup, plain prose, and provider error text stay in the
+  scratchpad. The system prompt and post-compaction reminder teach this
+  contract.
+
+Task runs keep their existing one-door task path in either mode: outbound tools
+deliver and final text becomes the run log summary.
+
+For tools-only chat turns, the runner reads delivery from `messages_out`. Each
+human-triggered inbound row creates a reply obligation with its full address and
+`in_reply_to` id. At each provider result, the runner settles obligations from
+new outbound rows, using an exact request stamp first and the destination address
+otherwise. It judges only requests whose provider prompt has run, so a follow-up
+pushed during an active turn waits for its own result. A dry request gets one
+correction; if the correction is also dry, the runner sends a neutral placeholder
+to that request's address. Agent-channel wakes receive the same bounded correction
+but remain silent after it because they have no human endpoint. Webhook wakes do
+not create a reply obligation.
+
+The runner publishes `current_reply_route` and a separate outbound-sequence turn
+baseline whenever a queued exchange becomes active. The route keeps tool replies
+on the request and thread being answered. The baseline also limits
+`send_message` to one plain message per destination per tools-only turn, which
+prevents small models from sending several paraphrases after a successful call;
+the next user turn receives a fresh budget. Envelope mode keeps the existing
+unlimited tool behavior.
+
+This accounting assumes one provider `result` for each pushed prompt. The runner
+logs extra results and prompts that end without a result. Tests live in
+`delivery-mode.test.ts` and `delivery-mode.followup.test.ts`.
 
 ### Message Formatting
 
@@ -511,17 +613,22 @@ written by the host) resolves the name to routing fields.
   name: 'send_message',
   params: {
     text: string,    // message content (required)
-    to?: string,     // destination name (e.g. "family", "worker-1").
-                     // Optional when the agent has exactly one destination.
+    to: string,      // destination name (e.g. "family", "worker-1") (required —
+                     // the agent always addresses a destination explicitly)
   }
 }
 ```
 
-Implementation: `resolveRouting(to)` looks up the destination. With no `to`, it defaults to
-the session's own reply routing (`session_routing`); if the destination resolves to the same
-channel the session is bound to, the session's `thread_id` is preserved so the reply lands
-in-thread, otherwise `thread_id` is null. The tool then writes a `messages_out` row with
-`kind: 'chat'` and content `{ text }`, and returns the new `seq` as the message id.
+Implementation: `resolveRouting(to)` looks up the destination. A channel destination gets its
+`thread_id` from `resolveDestinationThread` (`db/session-routing.ts`): the thread of the message
+being answered (the reply stamp the poll loop publishes in `session_state` at batch start and again at
+every turn boundary, since the query stays open and later messages are pushed into it) when that message came from the destination channel; otherwise the latest
+`messages_in` row from that channel. The poll loop's `<message to>` deliveries use the same resolver with the batch's routing
+context, so all explicit sends thread identically, and a message arriving mid-turn from another
+thread cannot pull the reply away. `session_routing.thread_id` is never consulted — it is null for
+every session that isn't per-thread. An agent destination always gets a null `thread_id`. The tool
+then writes a `messages_out` row with `kind: 'chat'` and content `{ text }`, and returns the new
+`seq` as the message id.
 
 #### send_file
 
@@ -532,7 +639,7 @@ Send a file to a named destination (same destination model as `send_message`).
   name: 'send_file',
   params: {
     path: string,          // file path (relative to /workspace/agent/ or absolute) (required)
-    to?: string,           // destination name; optional if the agent has one destination
+    to: string,            // destination name (required)
     text?: string,         // optional accompanying message
     filename?: string,     // display name (default: basename of path)
   }
@@ -544,6 +651,11 @@ Implementation:
 2. Generate a message ID and create `/workspace/outbox/{messageId}/`
 3. Copy the file into that outbox directory
 4. Write a `messages_out` row (`kind: 'chat'`) with content `{ text, files: [filename] }`
+
+`send_card` and `ask_user_question` go to the chat the session is bound to (`session_routing`), threaded like
+`send_message` / `send_file`: `resolveDestinationThread` with the published reply stamp — the
+thread of the message being answered, else the chat's latest `messages_in` thread. The bound
+`thread_id` is the last resort, when that yields no thread (a per-thread session stays in it).
 
 #### send_card
 

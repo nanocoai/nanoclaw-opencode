@@ -1,159 +1,74 @@
-/**
- * Integration test for the opencode provider's HOST-side reach-in: the self-registration
- * import in the src/providers/index.ts barrel. Importing the barrel runs opencode.ts's
- * top-level registerProviderContainerConfig('opencode', …); without that import line the
- * host never wires the provider's per-session mounts / env passthrough.
- *
- * Behavior, not structural, and BARREL-ONLY: it imports the real barrel (./index.js),
- * never ./opencode.js directly, then asserts the registry actually contains the provider.
- * Importing the provider module directly (as opencode.factory.test.ts does) self-registers
- * it and would stay GREEN even if the barrel line were deleted — that is a unit test,
- * not a registration guard. This test goes red if the barrel import is deleted/drifts,
- * or the barrel fails to evaluate.
- *
- * A provider is a MULTI-POINT integration: this guards the HOST barrel; the CONTAINER
- * barrel is guarded by the sibling bun test; the SDK/CLI dependency + Dockerfile install
- * are guarded by the build/container legs (see the skill's validate step).
- */
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
-import { describe, it, expect } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
-import { DATA_DIR } from '../config.js';
-import { getProviderContainerConfig, listProviderContainerConfigNames } from './provider-container-registry.js';
-import './index.js'; // the real host provider barrel — triggers each provider's self-registration
+const fixture = vi.hoisted(() => ({ root: '' }));
+vi.mock('../config.js', async (original) => {
+  const fs = await import('fs');
+  const os = await import('os');
+  const path = await import('path');
+  fixture.root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-host-'));
+  return { ...(await original<typeof import('../config.js')>()), DATA_DIR: fixture.root };
+});
+vi.mock('../env.js', () => ({ readEnvFile: () => ({}) }));
+import './index.js';
+import '../provider-contracts/index.js';
+import { getProviderContainerConfig } from './provider-container-registry.js';
+import { getProviderHostContract } from '../provider-contracts/registry.js';
 
-describe('opencode provider host registration', () => {
-  it('registers opencode host container-config via the barrel', () => {
-    expect(listProviderContainerConfigNames()).toContain('opencode');
+afterAll(() => fs.rmSync(fixture.root, { recursive: true, force: true }));
+function context(hostEnv: NodeJS.ProcessEnv = {}) {
+  return {
+    sessionDir: path.join(fixture.root, 'session'),
+    groupDir: path.join(fixture.root, 'group'),
+    agentGroupId: 'test',
+    selectedSkills: [],
+    hostEnv,
+    coreOwnsProviderSurfaces: true as const,
+  };
+}
+describe('OpenCode host payload', () => {
+  it('keeps the installed CLI and SDK on the same supported exact pin', () => {
+    const tools = JSON.parse(fs.readFileSync(new URL('../../container/cli-tools.json', import.meta.url), 'utf8'));
+    const runner = JSON.parse(
+      fs.readFileSync(new URL('../../container/agent-runner/package.json', import.meta.url), 'utf8'),
+    );
+    expect(tools.find((entry: { name: string }) => entry.name === 'opencode-ai')).toMatchObject({
+      version: '1.18.25',
+      onlyBuilt: true,
+    });
+    expect(runner.dependencies['@opencode-ai/sdk']).toBe('1.18.25');
   });
-
-  it('turns the group-selected model and provider settings into per-container env', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-registration-'));
-    try {
-      const contribution = await getProviderContainerConfig('opencode')!({
-        sessionDir: root,
-        agentGroupId: 'selected-group',
-        groupDir: root,
-        selectedSkills: [],
-        model: 'openai/selected-live-model',
-        providerSettings: {
-          opencode: {
-            modelProvider: 'openai',
-            baseUrl: 'http://host.docker.internal:8891/v1',
-            contextLimit: 65536,
-          },
-        },
-        hostEnv: {
-          OPENCODE_MODEL: 'openai/global-default',
-          OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
-          OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
-        },
-      });
-      expect(contribution.env).toMatchObject({
-        OPENCODE_MODEL: 'openai/selected-live-model',
+  it('registers the implementation and version 1 surfaces through the actual barrels', () => {
+    expect(getProviderContainerConfig('opencode')).toBeTypeOf('function');
+    expect(getProviderHostContract('opencode')).toMatchObject({
+      seamVersion: 1,
+    });
+  });
+  it('passes backend defaults and preserves proxy exclusions without doing core filesystem work', async () => {
+    const contribution = await getProviderContainerConfig('opencode')!(
+      context({
         OPENCODE_PROVIDER: 'openai',
-        ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
-        OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
-        OPENCODE_NATIVE_ATTACHMENT_MAX_COUNT: '4',
-        OPENCODE_NATIVE_ATTACHMENT_MAX_BYTES: '10485760',
-      });
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+        OPENCODE_MODEL: 'openai/test-model',
+        NO_PROXY: 'internal.example',
+        no_proxy: 'lower.example',
+        ANTHROPIC_BASE_URL: 'http://localhost:8891/v1',
+      }),
+    );
+    expect(contribution.env).toMatchObject({
+      OPENCODE_MODEL: 'openai/test-model',
+      NO_PROXY: 'internal.example,127.0.0.1,localhost',
+      no_proxy: 'lower.example,127.0.0.1,localhost',
+    });
+    expect(contribution.mounts).toEqual([]);
+    expect(fs.existsSync(context().sessionDir)).toBe(false);
   });
-
-  it('clears inherited local endpoint defaults for a selected cloud provider', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-cloud-registration-'));
-    try {
-      const contribution = await getProviderContainerConfig('opencode')!({
-        sessionDir: root,
-        agentGroupId: 'cloud-group',
-        groupDir: root,
-        selectedSkills: [],
-        model: 'openrouter/provider/model',
-        providerSettings: {
-          opencode: {
-            modelProvider: 'openrouter',
-            baseUrl: null,
-            smallModel: 'openrouter/provider/model',
-            contextLimit: null,
-            outputLimit: null,
-            inputModalities: '',
-          },
-        },
-        hostEnv: {
-          ANTHROPIC_BASE_URL: 'http://host.docker.internal:8891/v1',
-          OPENCODE_MODEL_CONTEXT_LIMIT: '65536',
-          OPENCODE_MODEL_OUTPUT_LIMIT: '8192',
-        },
-      });
-      expect(contribution.env).toMatchObject({
-        OPENCODE_MODEL: 'openrouter/provider/model',
-        OPENCODE_PROVIDER: 'openrouter',
-      });
-      expect(contribution.env?.ANTHROPIC_BASE_URL).toBeUndefined();
-      expect(contribution.env?.OPENCODE_MODEL_CONTEXT_LIMIT).toBeUndefined();
-      expect(contribution.env?.OPENCODE_MODEL_OUTPUT_LIMIT).toBeUndefined();
-      expect(contribution.env?.OPENCODE_MODEL_INPUT_MODALITIES).toBeUndefined();
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it('mounts the OneCLI-only ChatGPT auth stub at OpenCode native auth.json', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-chatgpt-registration-'));
-    const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
-    // DATA_DIR is the LIVE install's data directory, not a fixture. A real
-    // install keeps its ChatGPT credential stub here, so stash it and put it
-    // back — otherwise running the suite silently destroys the credential and
-    // every ChatGPT-auth group then fails to spawn with "stub is missing".
-    const preexistingStub = fs.existsSync(stubPath) ? fs.readFileSync(stubPath) : null;
-    try {
-      fs.mkdirSync(path.dirname(stubPath), { recursive: true });
-      fs.writeFileSync(stubPath, '{"openai":{"type":"oauth","access":"onecli-managed"}}');
-      const contribution = await getProviderContainerConfig('opencode')!({
-        sessionDir: path.join(root, 'session'),
-        agentGroupId: 'chatgpt-group',
-        groupDir: root,
-        selectedSkills: [],
-        model: 'openai/gpt-5.4',
-        providerSettings: { opencode: { modelProvider: 'openai', authMode: 'chatgpt' } },
-        hostEnv: { OPENCODE_AUTH_MODE: 'chatgpt' },
-      });
-      expect(contribution.mounts).toContainEqual({
-        hostPath: fs.realpathSync(stubPath),
-        containerPath: '/opencode-xdg/opencode/auth.json',
-        readonly: true,
-      });
-      expect(fs.statSync(path.join(root, 'session', 'opencode-xdg', 'opencode', 'auth.json')).isFile()).toBe(true);
-    } finally {
-      if (preexistingStub) fs.writeFileSync(stubPath, preexistingStub, { mode: 0o600 });
-      else fs.rmSync(stubPath, { force: true });
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not apply the global ChatGPT login to an explicitly configured local endpoint', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-local-auth-registration-'));
-    try {
-      const contribution = await getProviderContainerConfig('opencode')!({
-        sessionDir: root,
-        agentGroupId: 'local-group',
-        groupDir: root,
-        selectedSkills: [],
-        model: 'openai/local-model',
-        providerSettings: {
-          opencode: { modelProvider: 'openai', baseUrl: 'http://host.docker.internal:8891/v1' },
-        },
-        hostEnv: { OPENCODE_AUTH_MODE: 'chatgpt' },
-      });
-      expect(contribution.mounts).not.toContainEqual(
-        expect.objectContaining({ containerPath: '/opencode-xdg/opencode/auth.json' }),
-      );
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+  it('selects ChatGPT mode without requiring or mounting any host auth file', async () => {
+    const contribution = await getProviderContainerConfig('opencode')!(context({ OPENCODE_AUTH_MODE: 'chatgpt' }));
+    expect(contribution.env).toMatchObject({ OPENCODE_AUTH_MODE: 'chatgpt' });
+    expect(contribution.mounts).toEqual([]);
+    expect(fs.existsSync(context().sessionDir)).toBe(false);
+    const api = await getProviderContainerConfig('opencode')!(context());
+    expect(api.env).toMatchObject({ OPENCODE_AUTH_MODE: 'api-key' });
   });
 });

@@ -10,11 +10,35 @@ root="$(cd "$here/../.." && pwd)"
 # shellcheck source=/dev/null
 source "$here/install-slug.sh"
 
+restarted=false
 case "$(uname -s)" in
-  Darwin) launchctl kickstart -k "gui/$(id -u)/$(launchd_label)" 2>/dev/null || true ;;
-  Linux) systemctl --user restart "$(systemd_unit)" 2>/dev/null \
-    || sudo systemctl restart "$(systemd_unit)" 2>/dev/null || true ;;
+  Darwin)
+    if launchctl kickstart -k "gui/$(id -u)/$(launchd_label)" 2>/dev/null; then restarted=true; fi
+    ;;
+  Linux)
+    if systemctl --user restart "$(systemd_unit)" 2>/dev/null \
+      || sudo systemctl restart "$(systemd_unit)" 2>/dev/null; then
+      restarted=true
+    fi
+    ;;
 esac
+
+# Linux installs without a usable systemd user bus run through the generated
+# nohup wrapper. Restart that exact checkout when no service manager accepted
+# the request; otherwise channel installs would leave the old host running and
+# the old socket could make the following readiness wait pass falsely.
+if [ "$restarted" = false ] && [ -x "$root/start-nanoclaw.sh" ]; then
+  if "$root/start-nanoclaw.sh"; then
+    restarted=true
+  else
+    echo "nanoclaw: nohup fallback restart failed" >&2
+    exit 1
+  fi
+fi
+
+if [ "$restarted" = false ]; then
+  echo "nanoclaw: no installed service or nohup launcher to restart" >&2
+fi
 
 # Wait up to ~30s for the CLI socket so `ncl` can connect on the next directive.
 for _ in $(seq 1 60); do

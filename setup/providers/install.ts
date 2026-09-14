@@ -18,70 +18,57 @@
  *      ends with `nc:run effect:build` / `effect:test` / `effect:external` (the
  *      external one re-invokes `--step provider-auth`, which would recurse). The
  *      setup flow already rebuilds the image and runs auth around this call, so
- *      those run effects are skipped via `skipEffects` (and `exec` additionally
- *      refuses them), leaving only the file-mutating commands the engine emits
- *      (the `nc:copy from-branch` git fetch/show). The fork-aware remote
- *      resolver remains available for skills that carry remote copy directives;
- *      self-contained payloads do not use it.
- *
- * This is an INSTALL, not a refresh: an already-wired payload is skipped, so a
- * re-run (every `--step provider-auth <name>`) is a no-op over the installed
- * code and never overwrites a local patch. `/update-skills` is the refresh path.
+ *      we scope `exec` to apply only the file-mutating commands the engine emits
+ *      (the `nc:copy from-branch` git fetch/show) and skip those heavyweight run
+ *      directives. The fork-aware remote resolver mirrors slack.ts exactly.
  *
  * Returns the engine's ApplyResult so the caller can decide whether a rebuild is
- * warranted (a fresh install applied something; a re-run over an installed
- * provider applied nothing) and surface any step the engine couldn't apply
- * deterministically (agentTasks / deferred → install failed: a provider install
- * is fully deterministic with no prompts).
+ * warranted (a fresh install always applied something) and surface any step the
+ * engine couldn't apply deterministically (agentTasks / deferred → install
+ * failed: a provider install is fully deterministic with no prompts).
  */
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 import { applySkill, type ApplyResult } from '../../scripts/skill-apply.js';
-
-/** Commands the directive engine emits that the surrounding setup flow owns. */
-function isFlowOwnedCommand(cmd: string): boolean {
-  return (
-    /\bpnpm\s+run\s+build\b/.test(cmd) ||
-    /\btsc\b/.test(cmd) ||
-    /container\/build\.sh/.test(cmd) ||
-    /\bvitest\b/.test(cmd) ||
-    /\bbun\s+test\b/.test(cmd) ||
-    // The skill's auth step re-invokes `--step provider-auth` — running it from
-    // inside the install would recurse. The flow runs runAuth itself.
-    /provider-auth/.test(cmd)
-  );
-}
+import {
+  verifyProviderContracts,
+  isPinnedBunVersion,
+  type ProviderContractVerification,
+} from '../../scripts/provider-contract-verifier.js';
+import { parseProviderDescriptor } from './skill-descriptor.js';
+import { portableDependencyCommand } from '../../scripts/update-skills.js';
 
 export interface ProviderInstallResult {
   apply: ApplyResult;
-  /** True when the engine applied at least one file mutation (a fresh install). False on a re-run over an installed provider. */
+  /** True when the engine applied at least one mutation (fresh/refreshed install). */
   changed: boolean;
   /** Non-deterministic leftovers — non-empty means the install did not fully apply. */
   blockers: string[];
+  verification: ProviderContractVerification;
 }
 
-export async function applyProviderSkill(skillDir: string, projectRoot: string): Promise<ProviderInstallResult> {
+export async function applyProviderSkill(
+  skillDir: string,
+  projectRoot: string,
+  options: { mode?: 'install' | 'refresh' } = {},
+): Promise<ProviderInstallResult> {
+  let bunOnHost = false;
+  try {
+    const version = execFileSync('bun', ['--version'], { cwd: projectRoot, stdio: 'pipe', encoding: 'utf8' }).trim();
+    bunOnHost = isPinnedBunVersion(projectRoot, version);
+  } catch {
+    /* Use the container's pinned Bun through pnpm below. */
+  }
   // A provider SKILL.md has no prompt directives (vault-only auth runs
   // separately). No resolveInput is passed: absent ⇒ any prompt defers, which
   // is exactly the old defer-all stub's semantics with no stub to maintain.
   const result = await applySkill(skillDir, projectRoot, {
-    // Install mode (the engine's default): a present payload file, barrel line,
-    // dependency, or manifest entry is skipped, never overwritten. This runs on
-    // EVERY `--step provider-auth <name>` — an expired token, a second backend
-    // — so it must not clobber an operator's local patch or force an image
-    // rebuild. Refreshing installed payload code to the current registry bytes
-    // and pins is `/update-skills` (scripts/update-skills.ts, refresh mode),
-    // which requires a clean working tree first.
-    //
-    // Build, test, and the auth re-invocation are the surrounding flow's job:
-    // skip them at the engine level so they land in `skipped`, not `applied`,
-    // and `changed` reflects real file mutations only (a bare no-op exec would
-    // still count each run as applied and rebuild the image on every re-auth).
+    mode: options.mode ?? 'install',
     skipEffects: ['build', 'test', 'external'],
-    exec: (cmd) => {
-      if (isFlowOwnedCommand(cmd)) return; // belt-and-braces for an untagged run
-      execSync(cmd, { cwd: projectRoot, stdio: 'pipe' });
-    },
+    resolveDependencyCommand: (request) => portableDependencyCommand(projectRoot, bunOnHost, request),
+    exec: (cmd) => execSync(cmd, { cwd: projectRoot, stdio: 'pipe', encoding: 'utf8' }),
     // Fork-aware: reuse the existing resolver (handles upstream/fork remotes and
     // the auto-add-upstream fallback) instead of assuming `origin` — same call
     // setup/channels/slack.ts makes for the `channels` branch.
@@ -94,9 +81,33 @@ export async function applyProviderSkill(skillDir: string, projectRoot: string):
   });
 
   const blockers = [...result.agentTasks.map((t) => t.reason), ...result.deferred];
+  // Verify in "required-declared" mode: the provider this skill installs must
+  // declare its contract, while any OTHER provider already in this install
+  // that predates the contract (a pre-contract payload) is tolerated. Without
+  // the option the verifier expects zero undeclared providers and would abort
+  // an otherwise-good install over an unrelated legacy payload.
+  const verification =
+    blockers.length === 0
+      ? await verifyProviderContracts(projectRoot, {
+          requiredDeclaredProviders: [installedProviderName(skillDir, projectRoot)],
+        })
+      : { status: 'skipped' as const, checks: [] };
+  if (verification.status === 'failed') blockers.push(verification.error ?? 'Provider contract verification failed');
   return {
     apply: result,
-    changed: result.applied.length > 0,
+    // Captured compatibility predicates run on every apply, but do not alter
+    // the image. Only file mutations and dependency commands warrant a build.
+    changed: result.journal.some((entry) => entry.op !== 'ran' || entry.undo !== undefined),
     blockers,
+    verification,
   };
+}
+
+/** The provider a `/add-<name>` skill installs, read from its `nanoclaw-provider` frontmatter. */
+export function installedProviderName(skillDir: string, projectRoot: string): string {
+  const directory = path.basename(skillDir);
+  const markdown = fs.readFileSync(path.join(projectRoot, skillDir, 'SKILL.md'), 'utf-8');
+  const descriptor = parseProviderDescriptor(markdown, directory);
+  if (!descriptor) throw new Error(`${directory}/SKILL.md has no nanoclaw-provider metadata`);
+  return descriptor.value;
 }

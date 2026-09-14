@@ -94,7 +94,8 @@ describe('codex installs from its hard-wired /add-codex skill in-process', () =>
   it('setup/auto.ts installs the picked provider in-process via applyProviderSkill', () => {
     const src = read('setup/auto.ts');
     expect(src).toContain('applyProviderSkill');
-    expect(src).toContain('.claude/skills/add-${agentProvider}');
+    expect(src).toContain('providerDescriptor.skillDir');
+    expect(src).toContain('listInstallableProviderDescriptors()');
     // No shell-out to a per-provider install script.
     expect(src).not.toContain('setup/add-${agentProvider}.sh');
     // The removed branch-enumeration machinery must not creep back in.
@@ -105,29 +106,17 @@ describe('codex installs from its hard-wired /add-codex skill in-process', () =>
   it('setup/provider-auth.ts installs the picked provider in-process via applyProviderSkill', () => {
     const src = read('setup/provider-auth.ts');
     expect(src).toContain('applyProviderSkill');
+    expect(src).toContain('getInstallableProviderDescriptor(name)?.skillDir');
     expect(src).not.toContain('setup/add-codex.sh');
   });
-});
 
-describe('opencode installs from its hard-wired self-contained skill', () => {
-  it('ships the skill payload on main without a providers-branch fetch', () => {
-    const skill = read('.claude/skills/add-opencode/SKILL.md');
-    expect(skill).toContain('payload/container/agent-runner/src/providers/opencode.ts');
-    expect(skill).not.toContain('from-branch:providers');
-  });
-
-  it('is offered by setup and mapped by the standalone auth step', () => {
-    expect(read('setup/auto.ts')).toContain("{ value: 'opencode', label: 'OpenCode'");
-    expect(read('setup/provider-auth.ts')).toContain("opencode: '.claude/skills/add-opencode'");
-  });
-
-  it('installs in the engine default mode — re-auth never overwrites an installed payload', () => {
-    // `--step provider-auth <name>` re-runs the install on every auth; refresh
-    // mode would re-copy payload files over local patches and rebuild the
-    // image each time. Payload refresh belongs to /update-skills only
-    // (behavioral coverage: setup/providers/install.test.ts).
+  it('setup owns the shared provider verifier instead of running the skill directive twice', () => {
     const src = read('setup/providers/install.ts');
-    expect(src).not.toContain("mode: 'refresh'");
     expect(src).toContain("skipEffects: ['build', 'test', 'external']");
+    expect(src).toContain('verifyProviderContracts');
+    expect(src).toContain("verification.status === 'failed'");
+    // The installed provider must declare its contract; unrelated pre-contract
+    // payloads already in the install must not abort setup.
+    expect(src).toContain('requiredDeclaredProviders: [installedProviderName(skillDir, projectRoot)]');
   });
 });

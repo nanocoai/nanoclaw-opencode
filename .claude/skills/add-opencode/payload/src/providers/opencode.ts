@@ -11,7 +11,6 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
@@ -19,6 +18,7 @@ const PASSTHROUGH_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
+  'OPENCODE_BASE_URL',
   'ANTHROPIC_BASE_URL',
   'OPENCODE_MODEL_CONTEXT_LIMIT',
   'OPENCODE_MODEL_OUTPUT_LIMIT',
@@ -43,41 +43,9 @@ function mergeNoProxy(current: string | undefined, additions: string): string {
   return [...parts].join(',');
 }
 
-interface OpenCodeProviderSettings {
-  authMode?: unknown;
-  modelProvider?: unknown;
-  baseUrl?: unknown;
-  smallModel?: unknown;
-  contextLimit?: unknown;
-  outputLimit?: unknown;
-  inputModalities?: unknown;
-}
-
-/** Apply group-owned settings over service defaults; invalid values fail closed to unset. */
-export function applyOpenCodeProviderSettings(env: Record<string, string>, settings: OpenCodeProviderSettings): void {
-  const setString = (property: keyof OpenCodeProviderSettings, envKey: string) => {
-    if (!(property in settings)) return;
-    const value = settings[property];
-    if (typeof value === 'string' && value.trim()) env[envKey] = value;
-    else delete env[envKey];
-  };
-  const setPositiveInteger = (property: keyof OpenCodeProviderSettings, envKey: string) => {
-    if (!(property in settings)) return;
-    const value = settings[property];
-    if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) env[envKey] = String(value);
-    else delete env[envKey];
-  };
-  setString('modelProvider', 'OPENCODE_PROVIDER');
-  setString('baseUrl', 'ANTHROPIC_BASE_URL');
-  setString('smallModel', 'OPENCODE_SMALL_MODEL');
-  setPositiveInteger('contextLimit', 'OPENCODE_MODEL_CONTEXT_LIMIT');
-  setPositiveInteger('outputLimit', 'OPENCODE_MODEL_OUTPUT_LIMIT');
-  setString('inputModalities', 'OPENCODE_MODEL_INPUT_MODALITIES');
-}
-
 registerProviderContainerConfig('opencode', (ctx) => {
   const opencodeDir = path.join(ctx.sessionDir, 'opencode-xdg');
-  fs.mkdirSync(opencodeDir, { recursive: true });
+  if (!ctx.coreOwnsProviderSurfaces) fs.mkdirSync(opencodeDir, { recursive: true });
 
   const env: Record<string, string> = {
     XDG_DATA_HOME: '/opencode-xdg',
@@ -89,39 +57,18 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // EnvironmentFile — so under launchd/systemd, ctx.hostEnv carries none of
   // these. Fall back to the `.env` file the way the claude provider does;
   // a real exported variable still wins over the file.
-  const dotenv = readEnvFile([...PASSTHROUGH_KEYS]);
+  const dotenv = readEnvFile([...PASSTHROUGH_KEYS, AUTH_MODE_KEY]);
   for (const key of PASSTHROUGH_KEYS) {
     const value = ctx.hostEnv[key] ?? dotenv[key];
     if (value) env[key] = value;
   }
 
-  const settings =
-    typeof ctx.providerSettings === 'object' && ctx.providerSettings !== null
-      ? (ctx.providerSettings as Record<string, unknown>).opencode
-      : undefined;
-  const opencode =
-    typeof settings === 'object' && settings !== null ? (settings as Record<string, unknown>) : undefined;
-  if (ctx.model) env.OPENCODE_MODEL = ctx.model;
-  if (opencode) applyOpenCodeProviderSettings(env, opencode);
-
-  const mounts = [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }];
-  let authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? readEnvFile([AUTH_MODE_KEY])[AUTH_MODE_KEY];
-  if (opencode) authMode = opencode.authMode === 'chatgpt' ? 'chatgpt' : undefined;
-  if (authMode === 'chatgpt') {
-    const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
-    if (!fs.existsSync(stubPath)) {
-      throw new Error('OpenCode ChatGPT auth is selected, but its OneCLI credential stub is missing; re-run setup');
-    }
-    // Docker must see the nested file target inside the outer XDG bind before
-    // it composes the read-only stub mount (especially under macOS virtiofs).
-    const authTarget = path.join(opencodeDir, 'opencode', 'auth.json');
-    fs.mkdirSync(path.dirname(authTarget), { recursive: true });
-    fs.closeSync(fs.openSync(authTarget, 'a'));
-    // OpenCode reads $XDG_DATA_HOME/opencode/auth.json. This RO file contains
-    // only onecli-managed sentinels plus non-secret account routing metadata;
-    // OneCLI replaces the bearer at the gateway boundary.
-    mounts.push({ hostPath: stubPath, containerPath: '/opencode-xdg/opencode/auth.json', readonly: true });
-  }
+  const mounts = ctx.coreOwnsProviderSurfaces
+    ? []
+    : [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }];
+  const authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? dotenv[AUTH_MODE_KEY];
+  // The container initializes its own non-secret auth state before server startup.
+  env[AUTH_MODE_KEY] = authMode === 'chatgpt' ? 'chatgpt' : 'api-key';
 
   return {
     mounts,

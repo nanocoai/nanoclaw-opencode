@@ -31,6 +31,19 @@ Spawn teammates from chat: every one gets its own bot identity, container, and m
 
 ---
 
+## This OpenCode fork
+
+`nanocoai/nanoclaw-opencode:main` is the development baseline for Claude and
+OpenCode agent groups in one NanoClaw instance. OpenCode ships as a self-contained
+`/add-opencode` skill and is offered by setup. Its source payload is included;
+no separate provider branch is needed. Channels remain installed through skills.
+
+See [the fork baseline and upgrade guide](docs/opencode-fork-baseline.md) for the
+reconciled work, delivery controls, and limits. **Existing experimental fork
+installs need the guide before updating**: older per-group backend routing and
+the OpenCode channel-provisioning wizard are preserved in history, but are not
+part of the current runtime contract.
+
 ## Why I Built NanoClaw
 
 [OpenClaw](https://github.com/openclaw/openclaw) is an impressive project, but I wouldn't have been able to sleep if I had given complex software I didn't understand full access to my life. OpenClaw has nearly half a million lines of code, 53 config files, and 70+ dependencies. Its security is at the application level (allowlists, pairing codes) rather than true OS-level isolation. Everything runs in one Node process with shared memory.
@@ -40,8 +53,8 @@ NanoClaw provides that same core functionality, but in a codebase small enough t
 ## Quick Start
 
 ```bash
-git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
-cd nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw-opencode.git nanoclaw-opencode
+cd nanoclaw-opencode
 bash nanoclaw.sh
 ```
 
@@ -53,8 +66,8 @@ bash nanoclaw.sh
 Run from a fresh v2 checkout next to your v1 install:
 
 ```bash
-git clone https://github.com/nanocoai/nanoclaw.git nanoclaw-v2
-cd nanoclaw-v2
+git clone https://github.com/nanocoai/nanoclaw-opencode.git nanoclaw-opencode
+cd nanoclaw-opencode
 bash migrate-v2.sh
 ```
 
@@ -106,7 +119,33 @@ your machine.
 One opt-in exception: you can [fetch a prebuilt agent image](docs/hardened-image.md) instead of
 building it locally. Fetching ours needs a free account, so we see your email address and when
 you ask for an image — nothing about your agents, and nothing after the image lands. Building
-locally needs no account and contacts nothing, and is the default.
+locally needs no account and contacts nothing, and is the default. The same account unlocks the
+[perks](#perks) below.
+
+## Perks
+
+The free account also opens the **community portal** at [portal.nanoclaw.dev](https://portal.nanoclaw.dev),
+a dashboard where you switch on what the account offers. Today that is Echo's hardened agent
+image and a managed Slack app for your agent, created and installed for you with no tokens to
+paste. Everything else in NanoClaw works without it.
+
+Setup opens the portal once. You sign in in the browser, approve the terminal you are running
+setup from, and enable the perk; the wizard notices and continues on its own. Enabling Echo is
+where you agree to Echo's terms, including whether you want product and security email. Close
+the page without enabling anything and setup carries on without the perk, then offers it once
+more later.
+
+What stays on your machine: the sign-in record and install token in `~/.config/nanoclaw/account.json`,
+one device key per machine in `~/.config/nanoclaw/device-key.json`, and this checkout's journal in
+`data/community-portal.json` (which perks are on, setup progress, the credentials a perk handed
+you), all mode `0600`. The install token never passes through the browser: the browser sees only
+the one-time sign-in code, and the token reaches this machine from the account service directly.
+The host keeps one outbound connection to the portal so a perk you change in the browser reaches
+the running agent; it sends nothing about your agents, messages or files.
+
+Revisit a step with `pnpm exec tsx setup/portal.ts --stage echo` or `--stage slack`. To sign a
+machine out, forget it under **Devices** in the portal: its token stops working and the host
+disconnects. Files, recovery commands and troubleshooting: [docs/community-portal.md](docs/community-portal.md).
 
 ## Usage
 

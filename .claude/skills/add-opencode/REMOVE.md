@@ -1,46 +1,100 @@
-# Remove OpenCode provider
+# Remove OpenCode
 
-This reverses every persistent change made by `/add-opencode`.
+Before removing code, switch each OpenCode group to an installed provider using
+`ncl groups config update --id <group-id> --provider claude`, then restart that
+group. Use `/migrate-memory` first if needed. Do not edit materialized
+`container.json` files or clear database rows directly.
 
-1. Delete `import './opencode.js';` from `src/providers/index.ts`,
-   `container/agent-runner/src/providers/index.ts`, and
-   `setup/providers/index.ts`. Delete
-   `import './opencode-channel-provisioning/index.js';` from
-   `src/modules/index.ts`.
-2. Delete `src/providers/opencode.ts`, its registration test,
-   `src/opencode-cli-tools.test.ts`, the three `setup/providers/opencode*`
-   files, `mcp-to-opencode*`, and every copied `opencode*.ts` file under the
-   container provider directory. Delete
-   `src/modules/opencode-channel-provisioning/`.
-3. From `container/agent-runner`, run `bun remove @opencode-ai/sdk`.
-4. Delete the `opencode-ai` object from `container/cli-tools.json`.
-5. Remove the `.env` keys setup wrote: `OPENCODE_PROVIDER`, `OPENCODE_MODEL`,
-   `OPENCODE_SMALL_MODEL`, `OPENCODE_AUTH_MODE` (ChatGPT backend only), and
-   `ANTHROPIC_BASE_URL` unless the Claude provider still uses it. Also drop
-   any operator-added overrides only OpenCode read: the three
-   `OPENCODE_MODEL_*` capability/limit keys and the two
-   `OPENCODE_NATIVE_ATTACHMENT_*` limit keys.
-6. Delete `data/opencode/openai-auth-stub.json`, the read-only
-   `onecli-managed` credential stub setup writes for the ChatGPT backend, and
-   the `data/opencode/` directory once it is empty.
-7. Delete the OneCLI secrets setup created, when nothing else uses them:
-   `OpenCode ChatGPT` (ChatGPT backend, host pattern `chatgpt.com`) and
-   `OpenCode <provider>` for API-key backends (for example
-   `OpenCode openrouter`). Run `onecli secrets list`, then
-   `onecli secrets delete --id <id>` for each.
-8. Switch every OpenCode group to an installed provider before rebuilding:
+Delete `import './opencode.js';` from these five barrels, leaving other imports:
 
-   ```bash
-   ncl groups config update --id <group-id> --provider claude
-   ```
+- `setup/providers/index.ts`
+- `src/providers/index.ts`
+- `src/provider-contracts/index.ts`
+- `container/agent-runner/src/providers/index.ts`
+- `container/agent-runner/src/provider-contracts/index.ts`
 
-9. Rebuild the project and image, then restart NanoClaw.
+Delete exactly the skill-owned copied files below. Leave shared registry,
+contract, memory, and cwd-shim files in place.
 
-Session state remains under each session directory so removal does not silently
-destroy conversations or credentials. Delete it separately only when the
-operator explicitly wants that data removed.
+`src/opencode-dockerfile.test.ts` is the guard the skill installed before the
+`cli-tools.json` migration; it is listed so removal also cleans older installs.
 
-The applied module migration is intentionally retained in the central database:
-provider connections and completed wizard metadata are operator data. Removing
-the registration import makes the tables inert; dropping them requires a
-separate explicit data-deletion decision.
+```bash
+rm -f container/agent-runner/src/provider-contracts/opencode.ts
+rm -f container/agent-runner/src/providers/mcp-to-opencode.test.ts
+rm -f container/agent-runner/src/providers/mcp-to-opencode.ts
+rm -f container/agent-runner/src/providers/opencode-config.ts
+rm -f container/agent-runner/src/providers/opencode-memory.ts
+rm -f container/agent-runner/src/providers/opencode-registration.test.ts
+rm -f container/agent-runner/src/providers/opencode-turn.ts
+rm -f container/agent-runner/src/providers/opencode.attachments.test.ts
+rm -f container/agent-runner/src/providers/opencode.config.test.ts
+rm -f container/agent-runner/src/providers/opencode.conformance.test.ts
+rm -f container/agent-runner/src/providers/opencode.empty-resume.test.ts
+rm -f container/agent-runner/src/providers/opencode.factory.test.ts
+rm -f container/agent-runner/src/providers/opencode.memory.test.ts
+rm -f container/agent-runner/src/providers/opencode.native.test.ts
+rm -f container/agent-runner/src/providers/opencode.question.test.ts
+rm -f container/agent-runner/src/providers/opencode.shared-runtime.test.ts
+rm -f container/agent-runner/src/providers/opencode.sse-cleanup.test.ts
+rm -f container/agent-runner/src/providers/opencode.ts
+rm -f container/agent-runner/src/providers/opencode-auth.ts
+rm -f container/agent-runner/src/providers/opencode-auth.test.ts
+rm -f scripts/opencode-auth-config.test.ts
+rm -f scripts/opencode-auth.test.ts
+rm -f scripts/opencode-auth.ts
+rm -f scripts/opencode-host.ts
+rm -f scripts/opencode-host.test.ts
+rm -f scripts/opencode-model-config.ts
+rm -f scripts/opencode-models.test.ts
+rm -f scripts/opencode-models.ts
+rm -f scripts/opencode-vault.test.ts
+rm -f scripts/opencode-vault.ts
+rm -f scripts/tsconfig.opencode-auth.json
+rm -f setup/providers/opencode.test.ts
+rm -f setup/providers/opencode.ts
+rm -f src/provider-contracts/opencode.ts
+rm -f src/providers/opencode-auth-stub.ts
+rm -f src/providers/opencode-registration.test.ts
+rm -f src/opencode-dockerfile.test.ts
+rm -f src/providers/opencode.ts
+```
+
+If an older skill version installed the memory plugin and managed config, remove
+those unused skill-owned files too, including ignored generated dependencies:
+
+```bash
+rm -f container/agent-runner/src/providers/opencode-memory-plugin.ts
+rm -f container/agent-runner/src/providers/opencode.compaction.test.ts
+rm -rf container/agent-runner/src/providers/opencode-managed-config
+```
+
+Recreating affected containers discards their old managed config symlinks. Leave
+other tools' config and persisted session data alone.
+
+If an older skill version installed `src/opencode-cli-tools.test.ts`, delete
+that legacy skill-owned test as well.
+
+Remove the runner dependency with `cd container/agent-runner && bun remove
+@opencode-ai/sdk`. Delete only the object named `opencode-ai` from
+`container/cli-tools.json`. Both package and lockfile must be updated together.
+
+If `DEFAULT_AGENT_PROVIDER=opencode` is saved in `.env`, change only that key to
+`claude` (or another installed provider) before restarting the host. Then remove
+OpenCode-specific `.env` settings that are no longer used. Keep
+`ANTHROPIC_BASE_URL` if another integration still needs it. Session state,
+memory, and OneCLI secrets are user data: retain them unless the operator
+explicitly requests deletion. The fixed credential stub may remain unused.
+
+Run the host build and runner typecheck, then `./container/build.sh build` to
+remove the baked SDK and CLI from the local image. Restart the NanoClaw host
+using the installation's normal service workflow. Verify that no OpenCode
+import remains in any of the five barrels and neither dependency manifest
+contains its OpenCode entry. An uninstalled provider fails in the runner; the
+host can first warn and compose default surfaces. Switch affected groups before
+removing the skill.
+
+The host helper is removed with the payload. Remove `data/host-harness/opencode/`
+only if this installation created it and the operator wants its private CLI
+removed. Preserve globally installed OpenCode, native credentials, configuration,
+and conversation history. Existing native OpenCode can still run in this checkout.

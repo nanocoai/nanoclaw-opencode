@@ -8,10 +8,5 @@
     "name": "@anthropic-ai/claude-code",
     "version": "2.1.257",
     "onlyBuilt": true
-  },
-  {
-    "name": "opencode-ai",
-    "version": "1.18.25",
-    "onlyBuilt": true
   }
 ]

@@ -11,10 +11,9 @@ import {
 /**
  * Fake `/v2` question client — captures every reply/list call so tests can
  * assert what OpenCodeProvider sends back without spawning a real server.
- * This simulates the `question.asked` event path end to end: a caller hands
- * this fake the same `{ id, sessionID, questions }` shape the real SSE
- * stream would deliver in its `properties`, and we assert the auto-answer
- * that goes out the other side.
+ * These unit tests check reply/list behavior for native request shapes.
+ * opencode.shared-runtime.test.ts separately drives question.asked through
+ * the production event pump and requires its reply before the turn completes.
  */
 function createFakeQuestionClient(
   opts: {

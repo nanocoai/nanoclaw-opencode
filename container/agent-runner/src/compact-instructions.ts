@@ -9,38 +9,55 @@
  * Invoked by the PreCompact hook in .claude-shared/settings.json:
  *   "command": "bun /app/src/compact-instructions.ts"
  */
-import { getAllDestinations } from './destinations.js';
 import { loadConfig, type DeliveryMode } from './config.js';
+import { getAllDestinations } from './destinations.js';
 import { getTaskSeriesId } from './db/session-routing.js';
 
 /**
- * The delivery-contract sentences every "context was just rebuilt" path
- * re-states: the closing reminder of the compaction summary here, and the
- * OpenCode provider's first prompt after an SDK-side auto-compaction
- * (`providers/opencode.ts`). One source, so the two paths cannot drift on
- * what actually delivers in this session — which is decided by the poll-loop,
- * not by the provider.
+ * The canonical delivery-discipline sentences, shared by the pre-compaction
+ * steering below and the post-compaction reminder some providers inject when
+ * their runtime offers no compaction-prompt hook. Core owns this wording;
+ * providers must not restate it in their own words.
  */
-export function buildDeliveryReminder(
+export function buildDeliverySentences(
   names: string[],
   taskId: string | null,
   deliveryMode: DeliveryMode = 'envelope',
 ): string[] {
-  const destinations = `Available destinations: ${formatDestinationNames(names)}.`;
-  if (taskId) {
-    return [
-      'This is an isolated task run. If you need to send the user a message, use send_message with an explicit to destination.',
-      `Final output is not delivered; it becomes the automatic summary in tasks/${taskId}.md.`,
-      destinations,
-    ];
-  }
-  if (deliveryMode === 'tools-only') {
-    return [
-      'Only real outbound tool calls deliver. Response prose and <message> blocks are private scratchpad.',
-      destinations,
-    ];
-  }
-  return ['You MUST wrap all responses in <message to="name">...</message> blocks.', destinations];
+  return taskId
+    ? [
+        'This is an isolated task run. If you need to send the user a message, use send_message with an explicit to destination.',
+        `Final output is not delivered; it becomes the automatic summary in tasks/${taskId}.md.`,
+        `Available destinations: ${formatDestinationNames(names)}.`,
+      ]
+    : deliveryMode === 'tools-only'
+      ? [
+          'Only send_message, send_file, send_card and ask_user_question deliver anything.',
+          'Everything you write in a response is a private scratchpad; <message to="name"> blocks deliver nothing.',
+          `Available destinations: ${formatDestinationNames(names)}.`,
+        ]
+      : [
+          'You MUST wrap all responses in <message to="name">...</message> blocks.',
+          `Available destinations: ${formatDestinationNames(names)}.`,
+        ];
+}
+
+/**
+ * Reminder a provider injects on the first prompt AFTER its runtime
+ * auto-compacted the session, for runtimes that expose no
+ * pre-compaction instruction hook: the summary can silently drop the delivery
+ * discipline, so it is re-stated — in the same canonical wording as the
+ * pre-compaction path — before the next turn.
+ */
+export function buildPostCompactionReminder(
+  names: string[],
+  taskId: string | null,
+  deliveryMode: DeliveryMode = 'envelope',
+): string {
+  return (
+    '<system>The conversation was just compacted into a summary. Delivery instructions can be lost in ' +
+    `that summary, so as a reminder: ${buildDeliverySentences(names, taskId, deliveryMode).join(' ')}</system>`
+  );
 }
 
 export function buildCompactInstructions(
@@ -48,10 +65,9 @@ export function buildCompactInstructions(
   taskId: string | null,
   deliveryMode: DeliveryMode = 'envelope',
 ): string {
-  // Rendered as one quoted, indented block for the compaction prompt.
-  const reminder = buildDeliveryReminder(names, taskId, deliveryMode);
-  const deliveryReminder = reminder.map(
-    (line, index) => `   ${index === 0 ? '"' : ''}${line}${index === reminder.length - 1 ? '"' : ''}`,
+  const sentences = buildDeliverySentences(names, taskId, deliveryMode);
+  const deliveryReminder = sentences.map(
+    (sentence, index) => `   ${index === 0 ? '"' : ''}${sentence}${index === sentences.length - 1 ? '"' : ''}`,
   );
 
   return [

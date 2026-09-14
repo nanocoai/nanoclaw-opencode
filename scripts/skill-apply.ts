@@ -25,6 +25,8 @@
 import { execSync } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, appendFileSync, copyFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { gitFetchBranchCommand } from './git-fetch-branch.js';
+import { gitShowToFileCommand } from './git-show-to-file.js';
 import { parseDirectives, promptVar, type Directive } from './skill-directives.js';
 
 // What an `nc:prompt` DECLARES about the value it needs — the core seam's input
@@ -307,7 +309,7 @@ export interface ApplyOptions {
   execStream?: (cmd: string) => Promise<StepOutcome>;
   // Run effects the CALLER owns and will perform itself — those runs are skipped
   // (not executed). e.g. a headless rebuild or a setup that restarts once at the
-  // end passes ['restart']; applyProviderSkill passes ['build','test','external'].
+  // end passes ['restart']; applyProviderSkill passes ['build','test'].
   skipEffects?: string[];
   // Resolve which remote carries a `from-branch` registry branch. Defaults to a
   // generic resolver (env override → first remote that has the branch → origin);
@@ -646,27 +648,31 @@ async function applyOne(
 ): Promise<void> {
   const { root, skillDir, exec, vars, journal } = ctx;
   switch (d.kind) {
-    case 'copy':
+    case 'copy': {
+      // Install fills gaps; only an explicit refresh replaces existing files.
+      // The block can contain both, so honor selfStatus's per-file decision.
+      const lines = d.body.filter((line) => ctx.mode === 'refresh' || !has(root, destOf(line)));
       if (d.attrs['from-branch']) {
         const b = String(d.attrs['from-branch']);
         const remote = ctx.resolveRemote(b);
-        await exec(`git fetch ${remote} ${b}`);
-        for (const l of d.body) {
+        await exec(gitFetchBranchCommand(remote, b));
+        for (const l of lines) {
           // The shell redirect can't create parent directories, and the dest
           // may not exist on trunk (e.g. container skills that live only on
           // the channels branch). Mirror the local-copy path's mkdir.
           mkdirSync(dirname(join(root, destOf(l))), { recursive: true });
-          await exec(`git show ${remote}/${b}:${srcOf(l)} > ${destOf(l)}`);
+          await exec(gitShowToFileCommand(`refs/remotes/${remote}/${b}`, srcOf(l), destOf(l)));
         }
       } else {
-        for (const l of d.body) {
+        for (const l of lines) {
           const dst = join(root, destOf(l));
           mkdirSync(dirname(dst), { recursive: true });
           copyFileSync(join(skillDir, srcOf(l)), dst);
         }
       }
-      for (const l of d.body) journal.push({ op: 'wrote', path: destOf(l) });
+      for (const l of lines) journal.push({ op: 'wrote', path: destOf(l) });
       break;
+    }
     case 'append': {
       const to = String(d.attrs.to);
       const marker = typeof d.attrs.at === 'string' ? d.attrs.at : undefined;

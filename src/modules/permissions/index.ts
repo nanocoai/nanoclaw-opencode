@@ -16,7 +16,6 @@
  * access gate is not registered and core defaults to allow-all.
  */
 import { recordDroppedMessage } from '../../db/dropped-messages.js';
-import { normalizeOptions } from '../../channels/ask-question.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, getMessagingGroup, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
@@ -32,7 +31,6 @@ import {
 import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
-import { DEFAULT_AGENT_PROVIDER } from '../../config.js';
 import { log } from '../../log.js';
 import { getDb } from '../../db/connection.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
@@ -60,12 +58,7 @@ import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pend
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { declineAndNotify, requestSenderApproval } from './sender-approval.js';
-import { ensureUserDm, isCachedUserDmEvent } from './user-dm.js';
-import {
-  getChannelAgentProvisioner,
-  getChannelAgentProvisioners,
-  type ChannelAgentProvisioningContext,
-} from './channel-agent-provisioner.js';
+import { ensureUserDm } from './user-dm.js';
 
 // ── Free-text name input state ──
 // Tracks approvers waiting for a text reply with the agent name. Keyed by
@@ -454,98 +447,6 @@ export async function wireApprovedChannel(
 }
 
 /**
- * Adapter instance the approver conversation goes through: the originating
- * channel's instance when the approver acts on that platform (one bot per
- * agent group — the registration card went out through it, see
- * `pickApprovalDelivery`), otherwise unhinted. Same rule as the
- * choose-existing / name-prompt paths in handleChannelApprovalResponse.
- */
-async function approverInstanceFor(row: PendingChannelApproval, channelType: string): Promise<string | undefined> {
-  const origin = await getMessagingGroup(row.messaging_group_id);
-  return channelType === origin?.channel_type ? origin.instance : undefined;
-}
-
-/**
- * Provider-provisioner view of one pending registration. `channelType` is
- * the platform the approver's click or reply arrived on; it selects the
- * adapter instance every prompt and card is delivered through.
- */
-async function provisioningContext(
-  row: PendingChannelApproval,
-  channelType: string,
-): Promise<ChannelAgentProvisioningContext> {
-  const instance = await approverInstanceFor(row, channelType);
-  const resolveApproverDm = () => ensureUserDm(row.approver_user_id, { instance });
-  return {
-    row,
-    async isApproverDm(event) {
-      if (await isCachedUserDmEvent(row.approver_user_id, event)) return true;
-      // The user_dms cache holds default-instance rows only. A named
-      // instance's DM is re-resolved (idempotent openDM) and matched exactly.
-      if (instance === undefined || instance === event.channelType) return false;
-      if ((event.instance ?? event.channelType) !== instance) return false;
-      const dm = await resolveApproverDm();
-      return dm !== null && dm.channel_type === event.channelType && dm.platform_id === event.platformId;
-    },
-    async deliverQuestion(title, question, rawOptions) {
-      const approverDm = await resolveApproverDm();
-      const adapter = getDeliveryAdapter();
-      if (!approverDm || !adapter) return false;
-      const options = normalizeOptions(rawOptions);
-      await updatePendingChannelApprovalCard(row.messaging_group_id, title, question, JSON.stringify(options));
-      try {
-        await adapter.deliver(
-          approverDm.channel_type,
-          approverDm.platform_id,
-          null,
-          'chat-sdk',
-          JSON.stringify({ type: 'ask_question', questionId: row.messaging_group_id, title, question, options }),
-          undefined,
-          approverDm.instance,
-        );
-        return true;
-      } catch (err) {
-        log.error('Channel registration: provisioner question delivery failed', {
-          messagingGroupId: row.messaging_group_id,
-          err,
-        });
-        return false;
-      }
-    },
-    async deliverText(text) {
-      const approverDm = await resolveApproverDm();
-      const adapter = getDeliveryAdapter();
-      if (!approverDm || !adapter) return;
-      try {
-        await adapter.deliver(
-          approverDm.channel_type,
-          approverDm.platform_id,
-          null,
-          'chat-sdk',
-          JSON.stringify({ text }),
-          undefined,
-          approverDm.instance,
-        );
-      } catch (err) {
-        log.error('Channel registration: provisioner status delivery failed', {
-          messagingGroupId: row.messaging_group_id,
-          err,
-        });
-      }
-    },
-    createAgent: (input) =>
-      createNewAgentGroup(input.name, {
-        provider: input.provider,
-        model: input.model,
-        instructions: input.instructions,
-        deliveryMode: input.deliveryMode,
-      }),
-    wireAgent: (agentGroupId, approverId) => wireApprovedChannel(row, agentGroupId, approverId),
-    cancel: () => deletePendingChannelApproval(row.messaging_group_id),
-  };
-}
-
-/**
  * Response handler for the unknown-channel registration card.
  *
  * Claim rule: questionId matches a pending_channel_approvals row (keyed
@@ -646,11 +547,6 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
 
   // ── Create new agent — prompt for free-text name ──
   if (payload.value === NEW_AGENT_VALUE) {
-    const provisioner = getChannelAgentProvisioner(DEFAULT_AGENT_PROVIDER);
-    if (provisioner) {
-      await provisioner.start(await provisioningContext(row, payload.channelType));
-      return true;
-    }
     const origin = await getMessagingGroup(row.messaging_group_id);
     const approverDm = await ensureUserDm(row.approver_user_id, {
       instance: payload.channelType === origin?.channel_type ? origin.instance : undefined,
@@ -697,18 +593,6 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     return true;
   }
 
-  // Continue any already-started provider flow even if the instance default
-  // changes during a host restart. Unrelated provisioners return false, and so
-  // does the active one for a core button (connect:<id>) — it abandons its
-  // wizard first — so the branches below still handle it.
-  const provisioners = getChannelAgentProvisioners();
-  if (provisioners.length > 0) {
-    const context = await provisioningContext(row, payload.channelType);
-    for (const provisioner of provisioners) {
-      if (await provisioner.handleResponse(context, payload)) return true;
-    }
-  }
-
   // ── Resolve target agent group (connect to existing or create new) ──
   let targetAgentGroupId: string;
 
@@ -753,14 +637,6 @@ registerResponseHandler(handleChannelApprovalResponse);
 registerMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   const userId = await extractAndUpsertUser(event);
   if (!userId) return false;
-
-  for (const provisioner of getChannelAgentProvisioners()) {
-    const messagingGroupId = await provisioner.pendingTextInputFor(userId);
-    if (!messagingGroupId) continue;
-    const provisionerRow = await getPendingChannelApproval(messagingGroupId);
-    if (!provisionerRow) continue;
-    return provisioner.handleText(await provisioningContext(provisionerRow, event.channelType), event, userId);
-  }
 
   const pending = awaitingNameInput.get(userId);
   if (!pending) return false;
